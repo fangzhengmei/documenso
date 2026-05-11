@@ -90,29 +90,41 @@
 │                                                             │
 │  1. 分配给自己的所有字段                                     │
 │  2. 分配给后续收件人（signingOrder >= 自己的 Order）的字段   │
-│     └── 仅限非签名字段（SIGNATURE 类型除外）                 │
 │     └── 且该收件人尚未 SIGNED                               │
+│     └── 仅限非 SIGNATURE 类型（见下方详细对比）              │
 │                                                             │
 │  不可操作：                                                  │
 │  ├── 前面顺序收件人的字段（Order < 自己的 Order）            │
 │  ├── 已 SIGNED 收件人的字段                                  │
-│  └── 后续收件人的签名字段（SIGNATURE 类型）                   │
+│  └── 后续收件人的 SIGNATURE 类型字段                         │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Assistant 对三类签名字段的可操作性对比
+
+| 字段类型 | get-fields-for-token 查询结果 | sign-field-with-token 可签署 | 实际可操作 | 原因分析 |
+|----------|-----------------------------|----------------------------|-----------|----------|
+| **SIGNATURE** | ❌ 不可获取 | ❌ 无法尝试签署 | **❌ 不可操作** | 查询时被 `type: { not: FieldType.SIGNATURE }` 过滤 |
+| **FREE_SIGNATURE** | ✅ 可以获取 | ❌ 需要签名数据 | **❌ 无法实际操作** | 查询时未被过滤，但签署时需要 isBase64 或 typedSignature，Assistant 无法提供 |
+| **INITIALS** | ✅ 可以获取 | ✅ 可以签署 | **✅ 可操作** | 被当作普通文本字段处理，Assistant 可以预填 |
+
+#### 详细分析
+
+**1. get-fields-for-token 链路（查询权限）**
 
 代码位置：`packages/lib/server-only/field/get-fields-for-token.ts:22-53`
 
 ```typescript
-// Assistant 获取字段的逻辑
 if (recipient.role === RecipientRole.ASSISTANT) {
   return await prisma.field.findMany({
     where: {
       OR: [
         {
-          type: { not: FieldType.SIGNATURE },  // 非签名字段
+          // ⚠️ 只排除了 SIGNATURE，没有排除 FREE_SIGNATURE 和 INITIALS
+          type: { not: FieldType.SIGNATURE },
           recipient: {
-            signingStatus: { not: SigningStatus.SIGNED },  // 收件人未签署
-            signingOrder: { gte: recipient.signingOrder ?? 0 },  // 后续或同序
+            signingStatus: { not: SigningStatus.SIGNED },
+            signingOrder: { gte: recipient.signingOrder ?? 0 },
             envelopeId: recipient.envelopeId,
           },
           envelope: { id: recipient.envelopeId, type: EnvelopeType.DOCUMENT },
@@ -125,6 +137,73 @@ if (recipient.role === RecipientRole.ASSISTANT) {
   });
 }
 ```
+
+**查询结论：**
+- `SIGNATURE`：被排除，Assistant 看不到
+- `FREE_SIGNATURE`：未被排除，Assistant 可以看到
+- `INITIALS`：未被排除，Assistant 可以看到
+
+**2. sign-field-with-token 链路（签署权限）**
+
+代码位置：`packages/lib/server-only/field/sign-field-with-token.ts:68-92`
+
+```typescript
+const field = await prisma.field.findFirstOrThrow({
+  where: {
+    id: fieldId,
+    recipient: {
+      ...(recipient.role !== RecipientRole.ASSISTANT
+        ? { id: recipient.id }
+        : {
+            // ⚠️ 只按 recipient 条件过滤，不按字段类型过滤
+            signingStatus: { not: SigningStatus.SIGNED },
+            signingOrder: { gte: recipient.signingOrder ?? 0 },
+            envelopeId: recipient.envelopeId,
+          }),
+    },
+  },
+  ...
+});
+```
+
+签署时的字段类型处理（`sign-field-with-token.ts:190-205`）：
+
+```typescript
+// isSignatureField = SIGNATURE 或 FREE_SIGNATURE
+const isSignatureField = field.type === FieldType.SIGNATURE || field.type === FieldType.FREE_SIGNATURE;
+
+let customText = !isSignatureField ? value : undefined;
+const signatureImageAsBase64 = isSignatureField && isBase64 ? value : undefined;
+const typedSignature = isSignatureField && !isBase64 ? value : undefined;
+
+if (isSignatureField && !signatureImageAsBase64 && !typedSignature) {
+  throw new Error('Signature field must have a signature');
+}
+```
+
+**签署结论：**
+- `SIGNATURE`：查询阶段已被过滤，无法到达签署阶段
+- `FREE_SIGNATURE`：可以查询到，但签署时需要 `isBase64` 图片或 `typedSignature`，Assistant 无法提供合法签名数据 → 实际无法操作
+- `INITIALS`：被当作普通文本字段处理（`isSignatureField = false`），Assistant 可以传入值 → **可操作**
+
+**3. 最终结论表格**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Assistant 签名字段权限边界                                          │
+│                                                                     │
+│  字段类型      │  查询结果  │  可签署  │  实际可操作  │  说明        │
+│  ─────────────┼────────────┼──────────┼──────────────┼──────────────│
+│  SIGNATURE    │     ❌      │    ❌    │     ❌        │  查询时被排除 │
+│  FREE_SIGNATURE│    ✅      │    ❌    │     ❌        │  需要签名数据 │
+│  INITIALS     │     ✅      │    ✅    │     ✅        │  普通文本字段 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键代码引用：**
+- `isSignatureField` 定义：`packages/prisma/guards/is-signature-field.ts:3-8`
+- get-fields-for-token：`packages/lib/server-only/field/get-fields-for-token.ts:22-53`
+- sign-field-with-token：`packages/lib/server-only/field/sign-field-with-token.ts:68-92, 190-205`
 
 **Assistant 何时记为 SIGNED：**
 

@@ -28,7 +28,7 @@
 | 状态 | 说明 |
 |------|------|
 | NOT_SIGNED | 未签署：收件人尚未完成操作 |
-| SIGNED | 已签署：收件人已完成签名/审批/查看 |
+| SIGNED | 已签署：收件人已完成签名/审批/查看/协助 |
 | REJECTED | 已拒绝：审批人拒绝了文档 |
 
 定义位置：`packages/prisma/schema.prisma:567-571`
@@ -53,7 +53,7 @@
 | SIGNER | 是 | 是 | 必须签署文档的核心参与方 |
 | APPROVER | 是 | 可选 | 必须审批文档，签名可选 |
 | VIEWER | 是 | 否 | 必须确认已查看文档 |
-| ASSISTANT | 是 | 否 | 为其他收件人预填字段（仅顺序签名可用） |
+| ASSISTANT | 是 | 否 | 预填字段助手（仅顺序签名可用） |
 | CC | 否 | 否 | 文档完成后收到副本 |
 
 定义位置：`packages/prisma/schema.prisma:573-579`
@@ -77,10 +77,116 @@
 - 适用于需要确认收到但无需签名的情况
 
 #### 助手（Assistant）
-- 可以为后续签名者预填字段值
-- 不能代签，不能提交完成
+
+**核心功能：**
+- 为后续收件人预填字段值
+- **可以提交完成**，提交后状态变为 `SIGNED`
 - **仅在顺序签名模式下可用**
-- 适用于行政人员为高管准备文档的场景
+
+**可操作范围（字段权限）：**
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Assistant (Order=1) 可操作的字段：                          │
+│                                                             │
+│  1. 分配给自己的所有字段                                     │
+│  2. 分配给后续收件人（signingOrder >= 自己的 Order）的字段   │
+│     └── 仅限非签名字段（SIGNATURE 类型除外）                 │
+│     └── 且该收件人尚未 SIGNED                               │
+│                                                             │
+│  不可操作：                                                  │
+│  ├── 前面顺序收件人的字段（Order < 自己的 Order）            │
+│  ├── 已 SIGNED 收件人的字段                                  │
+│  └── 后续收件人的签名字段（SIGNATURE 类型）                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+代码位置：`packages/lib/server-only/field/get-fields-for-token.ts:22-53`
+
+```typescript
+// Assistant 获取字段的逻辑
+if (recipient.role === RecipientRole.ASSISTANT) {
+  return await prisma.field.findMany({
+    where: {
+      OR: [
+        {
+          type: { not: FieldType.SIGNATURE },  // 非签名字段
+          recipient: {
+            signingStatus: { not: SigningStatus.SIGNED },  // 收件人未签署
+            signingOrder: { gte: recipient.signingOrder ?? 0 },  // 后续或同序
+            envelopeId: recipient.envelopeId,
+          },
+          envelope: { id: recipient.envelopeId, type: EnvelopeType.DOCUMENT },
+        },
+        {
+          recipientId: recipient.id,  // 自己的字段
+        },
+      ],
+    },
+  });
+}
+```
+
+**Assistant 何时记为 SIGNED：**
+
+```
+Assistant 提交流程：
+
+1. 完成自己的必填字段
+   └── 检查：uninsertedRecipientFields（分配给自己的必填未填字段）必须为空
+
+2. 在 UI 中选择要预填的后续收件人（RadioGroup 选择）
+   └── 显示所有 signingOrder >= 自己 Order 且有字段的收件人列表
+   └── 代码位置：apps/remix/app/components/general/document-signing/document-signing-form.tsx:171-203
+
+3. 点击 Continue 按钮 → 打开确认对话框
+
+4. 确认提交 → 调用 completeDocument()
+   └── 后台将 signingStatus 设为 SIGNED
+   └── 记录 signedAt 时间戳
+   └── 代码位置：packages/lib/server-only/document/complete-document-with-token.ts:279-290
+```
+
+**Assistant 提交条件（前端校验）：**
+
+```typescript
+// 必须先完成自己的必填字段才能点击 Continue
+const onAssistantFormSubmit = () => {
+  if (uninsertedRecipientFields.length > 0) {
+    return;  // 自己的必填字段未完成，不能提交
+  }
+  setIsConfirmationDialogOpen(true);
+};
+```
+
+代码位置：`apps/remix/app/components/general/document-signing/document-signing-form.tsx:89-95`
+
+**对流程推进的影响：**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Assistant 提交后的流程推进：                                │
+│                                                             │
+│  1. Assistant 状态变为 SIGNED                               │
+│                                                             │
+│  2. 由于是顺序签名模式，触发下一阶段通知逻辑                  │
+│     └── 代码：complete-document-with-token.ts:369-455       │
+│                                                             │
+│  3. 查找下一个待处理收件人（排除 CC）                        │
+│     └── signingOrder 最低的 NOT_SIGNED 收件人               │
+│                                                             │
+│  4. 可选：如果启用 allowDictateNextSigner                    │
+│     └── Assistant 可以指定下一个收件人的姓名/邮箱            │
+│     └── 代码：complete-document-with-token.ts:398-441       │
+│                                                             │
+│  5. 发送签名请求邮件给下一阶段收件人                          │
+│     └── 触发 send.signing.requested.email 任务              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**适用场景：**
+- 行政人员为高管准备文档（预填信息）
+- 一个人收集信息，另一个人最终签名
+- 减轻最终签署人的填写负担
 
 #### 抄送（CC）
 - 不参与签名流程
@@ -280,7 +386,7 @@ if (haveAllRecipientsSigned) {
 | Signer | 必须完成所有签名字段 → SIGNED |
 | Approver | 必须审批通过 → SIGNED |
 | Viewer | 必须确认查看 → SIGNED |
-| Assistant | 必须完成预填 → SIGNED |
+| Assistant | 完成自己的必填字段后可提交 → SIGNED |
 | CC | 无需操作，不影响完成条件 |
 
 ### 5.5 异常终止条件
@@ -322,7 +428,48 @@ if (haveAllRecipientsSigned) {
 └── 所有收件人（含 CC）收到完成文档
 ```
 
-### 示例 2：并行签署
+### 示例 2：Assistant 预填 + 顺序签
+
+```
+准备阶段 (DRAFT)
+├── 上传合同 PDF
+├── 启用顺序签名
+├── 设置收件人：
+│   ├── Order=1: 行政助理 (Assistant)
+│   │   └── 分配字段：合同编号、日期、甲方信息
+│   ├── Order=2: 部门主管 (Approver)
+│   ├── Order=3: 总经理 (Signer)
+│   │   └── 签名字段（Assistant 不可操作）
+│   └── Order=-: 档案部 (CC)
+└── 发送文档 → 状态变为 PENDING
+
+执行阶段 (PENDING)
+├── 阶段 1：行政助理操作
+│   ├── 可操作字段：
+│   │   ├── 自己的字段：合同编号、日期
+│   │   ├── 部门主管的非签名字段（如果有）
+│   │   └── 总经理的非签名字段（如甲方信息文本字段）
+│   ├── 不可操作：总经理的签名字段
+│   ├── 完成自己的必填字段
+│   ├── 在 UI 中选择预填的收件人
+│   ├── 点击 Continue → 确认 → 提交
+│   └── 状态变为 SIGNED → 通知部门主管
+│
+├── 阶段 2：部门主管审批
+│   ├── 看到助理预填的内容
+│   ├── 审批通过 → SIGNED → 通知总经理
+│
+└── 阶段 3：总经理签署
+    ├── 看到前面所有内容
+    ├── 签署自己的签名字段
+    └── 提交 → SIGNED
+
+完成阶段 (COMPLETED)
+├── 所有非 CC 收件人已 SIGNED
+└── 文档密封完成
+```
+
+### 示例 3：并行签署
 
 ```
 准备阶段 (DRAFT)
@@ -352,6 +499,10 @@ if (haveAllRecipientsSigned) {
 |------|----------|
 | 数据库枚举定义 | `packages/prisma/schema.prisma` |
 | 文档状态常量 | `packages/lib/constants/document.ts` |
+| 收件人角色常量 | `packages/lib/constants/recipient-roles.ts` |
 | 收件人轮次判断 | `packages/lib/server-only/recipient/get-is-recipient-turn.ts` |
-| 完成文档逻辑 | `packages/lib/server-only/document/complete-document-with-token.ts` |
-| 文档工具函数 | `packages/lib/utils/document.ts` |
+| Assistant 可操作字段查询 | `packages/lib/server-only/field/get-fields-for-token.ts` |
+| Assistant 签署字段逻辑 | `packages/lib/server-only/field/sign-field-with-token.ts` |
+| Assistant 收件人列表查询 | `packages/lib/server-only/recipient/get-recipients-for-assistant.ts` |
+| 完成文档逻辑（含阶段推进） | `packages/lib/server-only/document/complete-document-with-token.ts` |
+| Assistant 前端提交流程 | `apps/remix/app/components/general/document-signing/document-signing-form.tsx` |

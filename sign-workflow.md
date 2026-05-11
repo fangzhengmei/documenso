@@ -102,108 +102,160 @@
 
 ### Assistant 对三类签名字段的可操作性对比
 
-| 字段类型 | get-fields-for-token 查询结果 | sign-field-with-token 可签署 | 实际可操作 | 原因分析 |
-|----------|-----------------------------|----------------------------|-----------|----------|
-| **SIGNATURE** | ❌ 不可获取 | ❌ 无法尝试签署 | **❌ 不可操作** | 查询时被 `type: { not: FieldType.SIGNATURE }` 过滤 |
-| **FREE_SIGNATURE** | ✅ 可以获取 | ❌ 需要签名数据 | **❌ 无法实际操作** | 查询时未被过滤，但签署时需要 isBase64 或 typedSignature，Assistant 无法提供 |
-| **INITIALS** | ✅ 可以获取 | ✅ 可以签署 | **✅ 可操作** | 被当作普通文本字段处理，Assistant 可以预填 |
+#### FREE_SIGNATURE 的真实执行路径与 ZFullFieldSchema 的影响
 
-#### 详细分析
+**关键发现：FREE_SIGNATURE 是一个遗留/未完全实现的功能。** 在签署页的实际执行路径中，FREE_SIGNATURE 会在更早的阶段就失败，而不是在后端校验阶段。
 
-**1. get-fields-for-token 链路（查询权限）**
-
-代码位置：`packages/lib/server-only/field/get-fields-for-token.ts:22-53`
-
-```typescript
-if (recipient.role === RecipientRole.ASSISTANT) {
-  return await prisma.field.findMany({
-    where: {
-      OR: [
-        {
-          // ⚠️ 只排除了 SIGNATURE，没有排除 FREE_SIGNATURE 和 INITIALS
-          type: { not: FieldType.SIGNATURE },
-          recipient: {
-            signingStatus: { not: SigningStatus.SIGNED },
-            signingOrder: { gte: recipient.signingOrder ?? 0 },
-            envelopeId: recipient.envelopeId,
-          },
-          envelope: { id: recipient.envelopeId, type: EnvelopeType.DOCUMENT },
-        },
-        {
-          recipientId: recipient.id,  // 自己的字段
-        },
-      ],
-    },
-  });
-}
-```
-
-**查询结论：**
-- `SIGNATURE`：被排除，Assistant 看不到
-- `FREE_SIGNATURE`：未被排除，Assistant 可以看到
-- `INITIALS`：未被排除，Assistant 可以看到
-
-**2. sign-field-with-token 链路（签署权限）**
-
-代码位置：`packages/lib/server-only/field/sign-field-with-token.ts:68-92`
-
-```typescript
-const field = await prisma.field.findFirstOrThrow({
-  where: {
-    id: fieldId,
-    recipient: {
-      ...(recipient.role !== RecipientRole.ASSISTANT
-        ? { id: recipient.id }
-        : {
-            // ⚠️ 只按 recipient 条件过滤，不按字段类型过滤
-            signingStatus: { not: SigningStatus.SIGNED },
-            signingOrder: { gte: recipient.signingOrder ?? 0 },
-            envelopeId: recipient.envelopeId,
-          }),
-    },
-  },
-  ...
-});
-```
-
-签署时的字段类型处理（`sign-field-with-token.ts:190-205`）：
-
-```typescript
-// isSignatureField = SIGNATURE 或 FREE_SIGNATURE
-const isSignatureField = field.type === FieldType.SIGNATURE || field.type === FieldType.FREE_SIGNATURE;
-
-let customText = !isSignatureField ? value : undefined;
-const signatureImageAsBase64 = isSignatureField && isBase64 ? value : undefined;
-const typedSignature = isSignatureField && !isBase64 ? value : undefined;
-
-if (isSignatureField && !signatureImageAsBase64 && !typedSignature) {
-  throw new Error('Signature field must have a signature');
-}
-```
-
-**签署结论：**
-- `SIGNATURE`：查询阶段已被过滤，无法到达签署阶段
-- `FREE_SIGNATURE`：可以查询到，但签署时需要 `isBase64` 图片或 `typedSignature`，Assistant 无法提供合法签名数据 → 实际无法操作
-- `INITIALS`：被当作普通文本字段处理（`isSignatureField = false`），Assistant 可以传入值 → **可操作**
-
-**3. 最终结论表格**
+**完整执行链路逐段对齐：**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Assistant 签名字段权限边界                                          │
+│  字段获取阶段 (get-fields-for-token)                                │
+│  packages/lib/server-only/field/get-fields-for-token.ts:27-29      │
+├─────────────────────────────────────────────────────────────────────┤
+│  type: { not: FieldType.SIGNATURE }                                │
 │                                                                     │
-│  字段类型      │  查询结果  │  可签署  │  实际可操作  │  说明        │
-│  ─────────────┼────────────┼──────────┼──────────────┼──────────────│
-│  SIGNATURE    │     ❌      │    ❌    │     ❌        │  查询时被排除 │
-│  FREE_SIGNATURE│    ✅      │    ❌    │     ❌        │  需要签名数据 │
-│  INITIALS     │     ✅      │    ✅    │     ✅        │  普通文本字段 │
+│  ✅ SIGNATURE: ❌ 被过滤                                           │
+│  ✅ FREE_SIGNATURE: ✅ 未被过滤，可从 DB 查询到                      │
+│  ✅ INITIALS: ✅ 未被过滤                                          │
+└─────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  页面渲染阶段 (ZFullFieldSchema.parse)                              │
+│  apps/remix/app/components/general/envelope-signing/...renderer.tsx:130,195 │
+├─────────────────────────────────────────────────────────────────────┤
+│  ZFullFieldSchema = discriminatedUnion('type', [                    │
+│    ...                                                              │
+│    ZFieldSignatureSchema   // type: z.literal(FieldType.SIGNATURE) │
+│    ...                                                              │
+│    // ❌ 缺少 ZFieldFreeSignatureSchema！                          │
+│  ])                                                                 │
+│                                                                     │
+│  ✅ SIGNATURE: ✅ 解析成功                                         │
+│  ❌ FREE_SIGNATURE: ❌ parse 抛出错误！                            │
+│         └── 因为 type="FREE_SIGNATURE" 不在 discriminatedUnion 中  │
+│         └── 被 unsafeRenderFieldOnLayer 捕获 → setRenderError(true) │
+│  ✅ INITIALS: ✅ 解析成功                                          │
+└─────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  交互入口阶段 (match().exhaustive())                                │
+│  apps/remix/app/components/general/envelope-signing/...renderer.tsx:197-393 │
+├─────────────────────────────────────────────────────────────────────┤
+│  .with({ type: FieldType.SIGNATURE }, ...) → handleSignatureFieldClick │
+│  .with({ type: FieldType.INITIALS }, ...)  → handleInitialsFieldClick │
+│  .exhaustive()  // ❌ 没有 FREE_SIGNATURE 分支！                    │
+│                                                                     │
+│  ✅ SIGNATURE: ✅ 点击 → 签名弹窗 → 提交                          │
+│  ❌ FREE_SIGNATURE: ❌ 无法到达此阶段（渲染已失败）                 │
+│  ✅ INITIALS: ✅ 点击 → 预填姓名首字母 → 提交                      │
+└─────────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  后端校验阶段 (sign-field-with-token)                               │
+│  packages/lib/server-only/field/sign-field-with-token.ts:190-205    │
+├─────────────────────────────────────────────────────────────────────┤
+│  const isSignatureField =                                           │
+│    field.type === SIGNATURE || field.type === FREE_SIGNATURE        │
+│                                                                     │
+│  if (isSignatureField && !signatureImageAsBase64 && !typedSignature)│
+│    throw new Error('Signature field must have a signature');       │
+│                                                                     │
+│  ✅ SIGNATURE: ✅ 有签名数据则通过                                  │
+│  ❌ FREE_SIGNATURE: ❌ 无法到达此阶段（渲染已失败）                 │
+│  ✅ INITIALS: ✅ isSignatureField=false，走 customText 路径         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**关键代码引用：**
-- `isSignatureField` 定义：`packages/prisma/guards/is-signature-field.ts:3-8`
-- get-fields-for-token：`packages/lib/server-only/field/get-fields-for-token.ts:22-53`
-- sign-field-with-token：`packages/lib/server-only/field/sign-field-with-token.ts:68-92, 190-205`
+#### ZFullFieldSchema 对 FREE_SIGNATURE 的致命影响
+
+代码位置：`packages/lib/types/field.ts:182-193`
+
+```typescript
+export const ZFullFieldSchema = z.discriminatedUnion('type', [
+  ZFieldTextSchema,
+  ZFieldSignatureSchema,    // type: z.literal(FieldType.SIGNATURE)
+  ZFieldInitialsSchema,     // type: z.literal(FieldType.INITIALS)
+  // ... 其他字段类型
+  // ❌ 缺少 ZFieldFreeSignatureSchema！
+]);
+
+// 虽然定义了，但从未在 ZFullFieldSchema 中使用
+export const ZFieldFreeSignatureSchema = ZFieldSignatureSchema;
+```
+
+**影响分析：**
+
+1. **渲染阶段直接失败**：`envelope-signer-page-renderer.tsx:130` 调用 `ZFullFieldSchema.parse(unparsedField)`
+   - 如果 `unparsedField.type === "FREE_SIGNATURE"`，Zod discriminated union 找不到匹配项 → 抛出错误
+   - 错误被 `renderFieldOnLayer` 捕获 → `console.error(err)` + `setRenderError(true)`
+   - **页面不会渲染这个字段，也无法进行任何交互**
+
+2. **渲染器也不支持**：`packages/lib/universal/field-renderer/render-field.ts:88-90`
+
+```typescript
+.with(FieldType.FREE_SIGNATURE, () => {
+  throw new Error('Free signature fields are not supported');
+})
+```
+
+#### 三类字段最终可操作边界
+
+| 字段类型 | 可从 DB 查询 | ZFullFieldSchema 解析 | 页面渲染 | 点击交互 | 后端签署 | 实际可操作 |
+|----------|-------------|----------------------|---------|---------|---------|-----------|
+| **SIGNATURE** | ❌ 被 `not: SIGNATURE` 过滤 | N/A | ❌ 不可见 | ❌ 无法点击 | ❌ 无法尝试 | **❌ 不可操作** |
+| **FREE_SIGNATURE** | ✅ 未被过滤 | ❌ parse 失败 | ❌ 渲染错误 | ❌ 无交互入口 | ❌ 无法到达 | **❌ 不可操作（遗留功能）** |
+| **INITIALS** | ✅ 未被过滤 | ✅ 解析成功 | ✅ 正常渲染 | ✅ 点击触发弹窗 | ✅ 作为 customText 提交 | **✅ 可操作** |
+
+#### 详细代码引用
+
+**1. get-fields-for-token（查询权限）**
+- `packages/lib/server-only/field/get-fields-for-token.ts:27`：`type: { not: FieldType.SIGNATURE }`
+- 只排除 SIGNATURE，FREE_SIGNATURE 和 INITIALS 均可查询到
+
+**2. ZFullFieldSchema（前端 Schema 校验）**
+- `packages/lib/types/field.ts:112-115`：`ZFieldSignatureSchema.type = z.literal(FieldType.SIGNATURE)`
+- `packages/lib/types/field.ts:119`：`ZFieldFreeSignatureSchema = ZFieldSignatureSchema`（类型别名，未使用）
+- `packages/lib/types/field.ts:182-193`：`ZFullFieldSchema` 的 discriminated union **不包含** FREE_SIGNATURE
+
+**3. 页面渲染与交互**
+- `apps/remix/app/components/general/envelope-signing/envelope-signer-page-renderer.tsx:124-130`：`unsafeRenderFieldOnLayer` 中调用 `ZFullFieldSchema.parse()`
+- `apps/remix/app/components/general/envelope-signing/envelope-signer-page-renderer.tsx:400-407`：`renderFieldOnLayer` 捕获错误并设置 `setRenderError(true)`
+- `apps/remix/app/components/general/envelope-signing/envelope-signer-page-renderer.tsx:197-393`：`match().exhaustive()` 只有 SIGNATURE 分支，无 FREE_SIGNATURE 分支
+
+**4. 渲染器**
+- `packages/lib/universal/field-renderer/render-field.ts:88-90`：`.with(FieldType.FREE_SIGNATURE, () => throw new Error('Free signature fields are not supported'))`
+
+**5. 后端签署校验（仅为完整性，FREE_SIGNATURE 不会到达这里）**
+- `packages/lib/server-only/field/sign-field-with-token.ts:190`：`isSignatureField = SIGNATURE || FREE_SIGNATURE`
+- `packages/lib/server-only/field/sign-field-with-token.ts:203-205`：签名字段需要 `signatureImageAsBase64` 或 `typedSignature`
+
+#### 最终结论
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Assistant 对三类签名字段的可操作边界                                │
+│                                                                     │
+│  SIGNATURE                                                          │
+│  └── 查询阶段被过滤 → 不可见 → 不可操作                             │
+│                                                                     │
+│  FREE_SIGNATURE                                                     │
+│  └── DB 可查询到                                                    │
+│  └── ZFullFieldSchema.parse() 失败 → 页面渲染错误                   │
+│  └── 无交互入口 → 不可操作                                          │
+│  └── 结论：遗留/未完全实现的功能，实际上无法使用                      │
+│                                                                     │
+│  INITIALS                                                           │
+│  └── DB 可查询到                                                    │
+│  └── ZFullFieldSchema.parse() 成功                                 │
+│  └── 点击 → handleInitialsFieldClick → 预填姓名首字母              │
+│  └── 提交 → 后端作为 customText 处理                                │
+│  └── 结论：Assistant 可以为后续收件人预填 Initials 字段             │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 **Assistant 何时记为 SIGNED：**
 

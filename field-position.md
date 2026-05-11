@@ -7,7 +7,7 @@
 - **拖拽交互**：使用 `react-rnd` 库实现拖拽和调整大小
 - **坐标归一化**：将像素坐标转换为百分比坐标
 - **页码绑定**：将字段与特定页码绑定
-- **边界校验**：坐标约束在 0-100 范围内，页码从 1 开始
+- **多层约束**：UI 层限制在页面内，tRPC 层根据使用场景有不同校验强度
 - **自动保存**：防抖机制确保频繁操作不产生过多请求
 - **数据库存储**：使用 Decimal 类型精确存储坐标数据
 
@@ -484,50 +484,46 @@ ResizeObserver / window resize 监听 → 重新计算
 
 ## 3. 坐标边界校验与页码约束
 
-### 3.1 Zod 校验定义
+### 3.1 两条链路的校验差异
 
-所有坐标和页码都通过 Zod schema 进行严格校验：
+项目中存在两条字段保存链路，它们的 tRPC 层校验强度不同：
 
-代码位置：`packages/lib/types/field.ts:57-89`
+| 链路 | 路由 | Schema | 坐标约束 | 页码约束 | 使用场景 |
+|------|------|--------|----------|----------|----------|
+| **文档编辑链路** | `trpc.field.setFieldsForDocument` | `ZSetDocumentFieldsRequestSchema` | `.min(0)` 非负 | `.min(1)` | Web 端文档编辑页面自动保存 |
+| **Envelope API 链路** | `trpc.envelope.fields.set` | `ZSetEnvelopeFieldsRequestSchema` | `.min(0).max(100)` clamped | `.min(1)` | 通用 API、自动化工具、第三方集成 |
+
+#### 链路 1：文档编辑链路 - setFieldsForDocument
+
+使用 `ZSetDocumentFieldsRequestSchema`，坐标仅作**非负校验**：
+
+代码位置：`packages/trpc/server/field-router/schema.ts:108-124`
 
 ```typescript
-// 页码：最小值为 1
-export const ZFieldPageNumberSchema = z.number().min(1).describe('The page number the field will be on.');
-
-// X 坐标：0-100 百分比范围
-export const ZClampedFieldPositionXSchema = z
-  .number()
-  .min(0)
-  .max(100)
-  .describe('The percentage based X coordinate where the field will be placed.');
-
-// Y 坐标：0-100 百分比范围
-export const ZClampedFieldPositionYSchema = z
-  .number()
-  .min(0)
-  .max(100)
-  .describe('The percentage based Y coordinate where the field will be placed.');
-
-// 宽度：0-100 百分比范围
-export const ZClampedFieldWidthSchema = z
-  .number()
-  .min(0)
-  .max(100)
-  .describe('The percentage based width of the field on the page.');
-
-// 高度：0-100 百分比范围
-export const ZClampedFieldHeightSchema = z
-  .number()
-  .min(0)
-  .max(100)
-  .describe('The percentage based height of the field on the page.');
+export const ZSetDocumentFieldsRequestSchema = z.object({
+  documentId: z.number(),
+  fields: z.array(
+    z.object({
+      id: z.number().optional(),
+      type: z.nativeEnum(FieldType),
+      recipientId: z.number().min(1),
+      envelopeItemId: z.string(),
+      pageNumber: z.number().min(1),      // 页码 ≥ 1
+      pageX: z.number().min(0),           // 仅非负校验
+      pageY: z.number().min(0),           // 仅非负校验
+      pageWidth: z.number().min(0),       // 仅非负校验
+      pageHeight: z.number().min(0),      // 仅非负校验
+      fieldMeta: ZFieldMetaSchema,
+    }),
+  ),
+});
 ```
 
-### 3.2 校验应用位置
+注意：模板字段保存 `ZSetFieldsForTemplateRequestSchema` 使用相同的非负校验定义（schema.ts:130-146）。
 
-#### tRPC 路由层校验
+#### 链路 2：Envelope API 链路 - envelope.fields.set
 
-`set-envelope-fields.types.ts` 中应用这些约束：
+使用 `ZSetEnvelopeFieldsRequestSchema`，坐标有**严格的 0-100 clamped 约束**：
 
 代码位置：`packages/trpc/server/envelope-router/set-envelope-fields.types.ts:12-31`
 
@@ -553,11 +549,119 @@ export const ZSetEnvelopeFieldsRequestSchema = z.object({
 });
 ```
 
-#### 前端表单层校验
+### 3.2 Zod 校验定义对比
 
-`add-fields.types.ts` 中也有基础校验：
+`packages/lib/types/field.ts` 中定义了两套坐标 schema：
 
-代码位置：`packages/ui/primitives/document-flow/add-fields.types.ts:5-21`
+```typescript
+// 页码：最小值为 1（两条链路共用）
+export const ZFieldPageNumberSchema = z.number().min(1).describe('The page number the field will be on.');
+
+// ========== 非 clamped 版本（文档编辑链路使用） ==========
+
+export const ZFieldPageXSchema = z.number().min(0).describe('The X coordinate of where the field will be placed.');
+
+export const ZFieldPageYSchema = z.number().min(0).describe('The Y coordinate of where the field will be placed.');
+
+export const ZFieldWidthSchema = z.number().min(1).describe('The width of the field.');
+
+export const ZFieldHeightSchema = z.number().min(1).describe('The height of the field.');
+
+// ========== clamped 版本（Envelope API 使用） ==========
+
+export const ZClampedFieldPositionXSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based X coordinate where the field will be placed.');
+
+export const ZClampedFieldPositionYSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based Y coordinate where the field will be placed.');
+
+export const ZClampedFieldWidthSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based width of the field on the page.');
+
+export const ZClampedFieldHeightSchema = z
+  .number()
+  .min(0)
+  .max(100)
+  .describe('The percentage based height of the field on the page.');
+```
+
+### 3.3 两条链路约束差异的原因
+
+#### 为什么文档编辑链路只有非负校验？
+
+**原因 1：前端已有严格的 UI 约束**
+
+文档编辑链路是 Web 端页面专用，用户通过 `react-rnd` 组件进行拖拽，前端已通过以下机制保证坐标有效性：
+
+1. **`bounds` 属性限制**：`react-rnd` 限制拖拽范围在页面元素内
+   ```typescript
+   // field-item.tsx:253
+   bounds={`${PDF_VIEWER_PAGE_SELECTOR}[data-page-number="${field.pageNumber}"]`}
+   ```
+
+2. **`isWithinPageBounds` 校验**：添加字段时检查鼠标是否在页面边界内
+   ```typescript
+   // use-document-element.ts:50-71
+   if (event.clientY > top + height - halfMouseHeight || event.clientY < top + halfMouseHeight) {
+     return false;
+   }
+   if (event.clientX > left + width - halfMouseWidth || event.clientX < left + halfMouseWidth) {
+     return false;
+   }
+   ```
+
+3. **`getFieldPosition` 计算**：相对位置计算天然基于页面边界
+   ```typescript
+   // use-document-element.ts:30-41
+   x: ((fieldLeft - pageLeft) / pageWidth) * 100,   // 计算结果天然在 0-100 范围内
+   y: ((fieldTop - pageTop) / pageHeight) * 100,
+   ```
+
+**原因 2：内部私有路由，调用方可控**
+
+`setFieldsForDocument` 是内部业务逻辑，仅由 Web 端文档编辑页面调用，请求数据格式和来源完全可控。
+
+**原因 3：兼容历史数据和特殊场景**
+
+非负校验保留了一定灵活性，允许处理一些边缘情况（如字段宽度/高度计算的微小误差），而不会直接拒绝保存。
+
+#### 为什么 Envelope API 需要 0-100 clamped 约束？
+
+**原因 1：通用公共 API，调用方不可控**
+
+`trpc.envelope.fields.set` 是通用 API 接口，可能被以下场景调用：
+- 第三方集成系统
+- 自动化脚本
+- API 客户端
+- 迁移工具
+
+这些调用方可能通过代码直接构造请求，没有 Web UI 的约束保证。
+
+**原因 2：防御性编程，防止无效数据**
+
+百分比坐标的语义就是"相对于页面的百分比"，从业务逻辑上讲必须在 `[0, 100]` 范围内。超出这个范围的数据：
+- 可能导致字段渲染在页面外
+- 可能导致后续 PDF 导出异常
+- 可能造成页面布局问题
+
+Clamped 约束在数据入口处拦截无效数据，避免下游问题。
+
+**原因 3：数据质量保证**
+
+作为通用 API 层，需要确保写入数据库的数据符合业务语义，不依赖调用方的自我约束。
+
+### 3.4 前端表单层校验
+
+无论哪条链路，前端表单 `add-fields.types.ts` 中的校验保持一致（仅非负）：
 
 ```typescript
 export const ZAddFieldsFormSchema = z.object({
@@ -579,9 +683,9 @@ export const ZAddFieldsFormSchema = z.object({
 });
 ```
 
-### 3.3 UI 层约束 - 拖拽边界
+### 3.5 UI 层约束 - 拖拽边界
 
-除了数据校验，UI 层也通过 `bounds` 属性限制拖拽范围：
+UI 层通过 `react-rnd` 的 `bounds` 属性限制拖拽范围：
 
 代码位置：`packages/ui/primitives/document-flow/field-item.tsx:253`
 
@@ -592,7 +696,7 @@ export const ZAddFieldsFormSchema = z.object({
 />
 ```
 
-以及 `isWithinPageBounds` 在添加字段时的校验：
+添加字段时还会通过 `isWithinPageBounds` 校验鼠标位置：
 
 代码位置：`packages/lib/client-only/hooks/use-document-element.ts:50-71`
 
@@ -623,9 +727,9 @@ const isWithinPageBounds = useCallback((event: MouseEvent, pageSelector: string,
 }, []);
 ```
 
-### 3.4 后端业务约束
+### 3.6 后端业务约束
 
-`setFieldsForDocument` 中还有额外的业务约束：
+两条链路的后端业务逻辑中都有额外约束：
 
 代码位置：`packages/lib/server-only/field/set-fields-for-document.ts:107-119`
 
@@ -645,15 +749,25 @@ if (!existing && !canRecipientFieldsBeModified(recipient, existingFields)) {
 }
 ```
 
-### 3.5 校验层级汇总
+### 3.7 校验层级汇总
+
+#### 文档编辑链路（setFieldsForDocument）
 
 | 层级 | 校验内容 | 代码位置 |
 |------|----------|----------|
 | **UI 拖拽层** | 限制在页面范围内 | `field-item.tsx` bounds 属性 |
 | **添加字段时** | 鼠标位置在页面边界内 | `use-document-element.ts` isWithinPageBounds |
 | **前端表单** | pageNumber ≥ 1, pageX ≥ 0 等 | `add-fields.types.ts` |
-| **tRPC 路由** | page ≥ 1, positionX/Y 0-100, width/height 0-100 | `set-envelope-fields.types.ts` |
+| **tRPC 路由** | pageNumber ≥ 1, pageX ≥ 0（非负） | `field-router/schema.ts` |
 | **后端业务** | 已签名收件人字段不能修改 | `set-fields-for-document.ts` |
+
+#### Envelope API 链路（envelope.fields.set）
+
+| 层级 | 校验内容 | 代码位置 |
+|------|----------|----------|
+| **前端表单** | （取决于调用方） | - |
+| **tRPC 路由** | page ≥ 1, positionX/Y 0-100, width/height 0-100 | `set-envelope-fields.types.ts` |
+| **后端业务** | 已签名收件人字段不能修改 | `set-envelope-fields.ts` |
 
 ---
 
@@ -904,10 +1018,12 @@ if (duplicateAll) {
 | 属性名 | 类型 | 说明 |
 |--------|------|------|
 | `page` | Int | 页码，从 1 开始 |
-| `positionX` | Decimal | X 坐标百分比 (0-100) |
-| `positionY` | Decimal | Y 坐标百分比 (0-100) |
-| `width` | Decimal | 宽度百分比 (0-100) |
-| `height` | Decimal | 高度百分比 (0-100) |
+| `positionX` | Decimal | X 坐标百分比（理论范围 0-100） |
+| `positionY` | Decimal | Y 坐标百分比（理论范围 0-100） |
+| `width` | Decimal | 宽度百分比（理论范围 0-100） |
+| `height` | Decimal | 高度百分比（理论范围 0-100） |
+
+**注意**：数据库层面不强制 `0-100` 约束，约束在应用层（tRPC 路由或业务逻辑）实施。
 
 ### 7.2 为什么使用 Decimal？
 
@@ -920,7 +1036,7 @@ if (duplicateAll) {
 | 阶段 | 坐标格式 | 转换公式 | 代码位置 |
 |------|----------|----------|----------|
 | **用户操作** | 像素坐标 (px) | - | react-rnd |
-| **保存时** | 百分比 (0-100) | `(像素 / 页面尺寸) × 100` | `use-document-element.ts` |
+| **保存时** | 百分比 (理论 0-100) | `(像素 / 页面尺寸) × 100` | `use-document-element.ts` |
 | **数据库** | Decimal | - | Prisma Field 表 |
 | **读取时** | 百分比 → 像素 | `(百分比 / 100) × 当前页面尺寸` | `use-field-page-coords.ts` |
 
@@ -960,14 +1076,16 @@ if (isPlaceholderPosition(field)) {
 | 拖拽逻辑 | `packages/ui/primitives/document-flow/add-fields.tsx` | 字段添加、移动、调整的事件处理 |
 | 自动保存 | `packages/lib/client-only/hooks/use-autosave.ts` | 2秒防抖的保存队列 |
 | 保存入口 | `apps/remix/app/components/general/document/document-edit-form.tsx` | onAddFieldsFormAutoSave |
-| tRPC 路由 | `packages/trpc/server/field-router/router.ts` | setFieldsForDocument 路由 |
+| tRPC 路由（文档编辑） | `packages/trpc/server/field-router/router.ts` | setFieldsForDocument 路由 |
+| tRPC 约束（文档编辑） | `packages/trpc/server/field-router/schema.ts` | ZSetDocumentFieldsRequestSchema（非负校验） |
+| tRPC 路由（Envelope API） | `packages/trpc/server/envelope-router/router.ts` | envelope.fields.set 路由 |
+| tRPC 约束（Envelope API） | `packages/trpc/server/envelope-router/set-envelope-fields.types.ts` | ZClamped* 约束（0-100） |
 | 保存业务 | `packages/lib/server-only/field/set-fields-for-document.ts` | upsert 字段、审计日志 |
 | 读取入口 | `packages/trpc/server/document-router/get-document.ts` | document.get 路由 |
 | 读取查询 | `packages/lib/server-only/envelope/get-envelope-by-id.ts` | include fields |
 | 坐标转换 | `packages/lib/client-only/hooks/use-document-element.ts` | 像素 → 百分比 |
 | 渲染定位 | `packages/lib/client-only/hooks/use-field-page-coords.ts` | 百分比 → 像素 |
-| 约束定义 | `packages/lib/types/field.ts` | Zod schema 定义 |
-| 约束应用 | `packages/trpc/server/envelope-router/set-envelope-fields.types.ts` | tRPC 请求校验 |
+| 约束定义 | `packages/lib/types/field.ts` | Zod schema 定义（clamped/非 clamped 两套） |
 | 数据模型 | `packages/prisma/schema.prisma` | Field 表结构定义 |
 
 ---
@@ -979,7 +1097,9 @@ if (isPlaceholderPosition(field)) {
 1. **百分比坐标**：解决不同屏幕尺寸的适配问题
 2. **页码绑定**：每个字段与特定页面关联
 3. **Decimal 存储**：确保计算精度
-4. **多层校验**：UI → 表单 → tRPC → 业务逻辑
+4. **分层约束策略**：
+   - **文档编辑链路**：前端 UI 约束 + 后端非负校验（灵活）
+   - **Envelope API**：严格的 0-100 clamped 约束（防御性）
 5. **自动保存**：2秒防抖 + 队列处理
 6. **坐标系转换**：PDF 左下原点 → 网页左上原点
 
@@ -988,5 +1108,5 @@ if (isPlaceholderPosition(field)) {
 - ✅ 在不同设备和缩放级别下位置正确
 - ✅ 导出 PDF 时位置准确
 - ✅ 支持跨页面复制字段
-- ✅ 防止无效坐标写入数据库
+- ✅ 内部链路灵活高效，外部 API 严格防御
 - ✅ 已签名字段不可修改

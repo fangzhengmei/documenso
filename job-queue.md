@@ -211,8 +211,17 @@ try {
     data: { status: BackgroundJobStatus.COMPLETED, completedAt: new Date() },
   });
 } catch (error) {
+  console.log(`[JOBS]: Job ${options.name} failed`, error);
+
+  // 子任务超限：直接判定为死信
   const taskHasExceededRetries = error instanceof BackgroundTaskExceededRetriesError;
-  const jobHasExceededRetries = backgroundJob.retried >= backgroundJob.maxRetries;
+  
+  // 任务级重试超限 AND 错误不是子任务普通失败（即非 runTask 抛出的 BackgroundTaskFailedError）
+  // 注意: !(error instanceof BackgroundTaskFailedError) 这个分支意味着
+  // runTask 抛出的普通子任务失败不会触发任务级失败，而是继续重试
+  const jobHasExceededRetries =
+    backgroundJob.retried >= backgroundJob.maxRetries && 
+    !(error instanceof BackgroundTaskFailedError);
 
   if (taskHasExceededRetries || jobHasExceededRetries) {
     // 超过重试次数：标记为 FAILED（死信）
@@ -235,9 +244,12 @@ try {
 
 **代码可证结论：**
 1. Local 驱动在 HTTP handler 中 catch 所有异常
-2. 根据 `taskHasExceededRetries` 或 `jobHasExceededRetries` 判断是否为最后一次尝试
-3. 最后一次失败更新状态为 `FAILED`，否则重置为 `PENDING` 并重新调用 HTTP 回调
-4. 重试计数存储在 PostgreSQL `BackgroundJob.retried` 字段
+2. 两阶段判定逻辑：
+   - **子任务超限判定**：如果错误是 `BackgroundTaskExceededRetriesError`，直接标记失败
+   - **任务级超限判定**：只有当重试次数达到 `maxRetries` **AND** 错误不是 `BackgroundTaskFailedError` 时才标记失败
+3. 关键逻辑 `!(error instanceof BackgroundTaskFailedError)` 意味着：runTask 子任务的普通失败（`BackgroundTaskFailedError`）不会触发任务级死信，而是继续重试
+4. 最后一次失败更新状态为 `FAILED`，否则重置为 `PENDING` 并重新调用 HTTP 回调
+5. 重试计数存储在 PostgreSQL `BackgroundJob.retried` 字段
 
 ### 3.3 BullMQ 驱动的死信处理流程
 

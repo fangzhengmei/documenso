@@ -52,9 +52,9 @@ const createDocumentFromDirectTemplate = async () => {
 
 ---
 
-## 二、直链访问鉴权能力边界
+## 二、访问鉴权与动作鉴权能力边界
 
-### 2.1 明确的鉴权支持矩阵
+### 2.1 访问鉴权支持矩阵（Recipient级别）
 
 **文件位置**: `packages/lib/server-only/template/create-document-from-direct-template.ts:169-177`
 
@@ -75,23 +75,31 @@ const isAccessAuthValid = match(derivedRecipientAccessAuth.at(0))
 | **PASSKEY (生物密钥)** | ✓ 支持 | ✗ **不支持** | 不在match分支中 |
 | **PASSWORD (密码)** | ✓ 支持 | ✗ **不支持** | 不在match分支中 |
 
-### 2.2 直链签署动作鉴权
+### 2.2 动作鉴权支持矩阵（Field级别）
 
-直链签署的**动作鉴权**（ACTION）仅对**签名字段**生效：
-
-**文件位置**: `packages/lib/server-only/document/validate-field-auth.ts:29-31`
+**文件位置**: `packages/lib/server-only/document/validate-field-auth.ts:28-31`
 
 ```typescript
-// 非签名字段绕过动作鉴权
+// 仅SIGNATURE字段执行动作鉴权，包括FREE_SIGNATURE在内的其他字段全部跳过
 if (field.type !== FieldType.SIGNATURE) {
   return undefined; // 直接跳过，不验证
 }
 ```
 
-**动作鉴权支持情况**:
-- ✅ SIGNATURE / FREE_SIGNATURE 字段：执行完整动作鉴权
-- ⚠️ NAME / EMAIL / DATE / TEXT / NUMBER 等：**跳过动作鉴权**
-- ⚠️ CHECKBOX / RADIO / DROPDOWN：**跳过动作鉴权**
+| 字段类型 | 是否执行动作鉴权 | 备注 |
+|---------|----------------|------|
+| **SIGNATURE** | ✅ 执行 | 唯一受动作鉴权保护的字段类型 |
+| **FREE_SIGNATURE** | ❌ 跳过 | 与普通文本字段一样，不做鉴权 |
+| NAME | ❌ 跳过 | |
+| EMAIL | ❌ 跳过 | |
+| DATE | ❌ 跳过 | |
+| TEXT | ❌ 跳过 | |
+| NUMBER | ❌ 跳过 | |
+| CHECKBOX | ❌ 跳过 | |
+| RADIO | ❌ 跳过 | |
+| DROPDOWN | ❌ 跳过 | |
+
+**关键结论**: **动作鉴权仅对 `SIGNATURE` 类型字段生效**，包括 `FREE_SIGNATURE` 在内的所有其他字段类型都会直接绕过鉴权检查。
 
 ---
 
@@ -113,6 +121,7 @@ if (field.type !== FieldType.SIGNATURE) {
 | **Field.inserted 初始值** | false | 直链收件人字段=**true**<br>其他收件人字段=false | false | ✓ line 644<br>✓ line 405 |
 | **Field.customText** | 空或预填充值 | 直链字段已填充签名值 | 空字符串 | ✓ line 643<br>✓ line 404 |
 | **Field.fieldMeta** | ✓ 完整继承模板字段元数据 | ✓ 完整继承模板字段元数据 | ✓ 调用方传入 | ✓ line 645<br>✓ line 406 |
+| **动作鉴权保护字段** | 仅 SIGNATURE | 仅 SIGNATURE | 仅 SIGNATURE | ✓ validate-field-auth.ts line 29 |
 | **Signature 记录创建** | 未创建，待后续签署时生成 | ✓ 直链收件人签名字段已创建Signature | 未创建，待后续签署时生成 | ✓ line 459-497<br>✓ 签名字段单独处理 |
 | **PDF复制策略** | 使用 `putNormalizedPdfFileServerSide` 复制 | 使用 `putPdfFileServerSide` 复制 | 不复制，直接引用已有 documentDataId | ✓ line 479<br>✓ line 285<br>✓ line 51 |
 | **DocumentMeta 继承** | ✓ 完整继承模板配置 | ✓ 完整继承模板配置 | ✓ 调用方传入 meta 参数 | ✓ line 507-525<br>✓ line 304-306 |
@@ -137,7 +146,8 @@ if (field.type !== FieldType.SIGNATURE) {
     │     └─> fields[]
     │           ├─> inserted = false
     │           ├─> customText = '' 或预填充值
-    │           └─> fieldMeta 完整继承
+    │           ├─> fieldMeta 完整继承
+    │           └─> 动作鉴权：仅 SIGNATURE 字段受保护
     ├─> envelopeItems[]
     │     └─> PDF二进制复制：putNormalizedPdfFileServerSide
     ├─> 附件：模板附件 + 调用方传入附件
@@ -159,7 +169,8 @@ if (field.type !== FieldType.SIGNATURE) {
     │     │           ├─> inserted = true
     │     │           ├─> customText = 用户签名值
     │     │           ├─> Signature 记录已创建 ✓
-    │     │           └─> fieldMeta 完整继承
+    │     │           ├─> fieldMeta 完整继承
+    │     │           └─> 动作鉴权：仅 SIGNATURE 字段验证
     │     └─> [其他收件人]
     │           ├─> token = nanoid()
     │           ├─> signingStatus = NOT_SIGNED
@@ -189,7 +200,8 @@ if (field.type !== FieldType.SIGNATURE) {
           │     └─> fields[] (位置+类型配置，无预填充值)
           │           ├─> inserted = false
           │           ├─> customText = ''
-          │           └─> fieldMeta 调用方传入
+          │           ├─> fieldMeta 调用方传入
+          │           └─> 动作鉴权：仅 SIGNATURE 字段受保护
           ├─> envelopeItems[]
           │     └─> documentDataId = 直接引用已上传资源，不复制
           ├─> + 团队默认收件人
@@ -205,12 +217,12 @@ if (field.type !== FieldType.SIGNATURE) {
 
 **文件位置**: `packages/lib/server-only/field/sign-field-with-token.ts`
 
-| 场景 | 使用 signFieldWithToken | 备注 |
-|------|------------------------|------|
-| 模板克隆后收件人签署 | ✓ | 标准签署流程 |
-| 直链即时签署 | ✗ | 内部独立实现字段验证和Signature创建 |
-| 普通文档邮件签署 | ✓ | 标准签署流程 |
-| 嵌入签署最终签名动作 | ✓ | 嵌入渲染后调用标准签名 |
+| 场景 | 使用 signFieldWithToken | 动作鉴权生效范围 |
+|------|------------------------|----------------|
+| 模板克隆后收件人签署 | ✓ | 仅 SIGNATURE |
+| 直链即时签署 | ✗ 内部独立实现 | 仅 SIGNATURE |
+| 普通文档邮件签署 | ✓ | 仅 SIGNATURE |
+| 嵌入签署最终签名动作 | ✓ | 仅 SIGNATURE |
 
 ### 4.2 signFieldWithToken 标准流程
 
@@ -223,7 +235,7 @@ export const signFieldWithToken = async () => {
   // 5. 验证 recipient 未签署
   // 6. 验证 field 未 inserted
   // 7. 按字段类型验证值格式 (NUMBER/TEXT/CHECKBOX等)
-  // 8. 调用 validateFieldAuth 执行动作鉴权
+  // 8. 调用 validateFieldAuth 执行动作鉴权（仅SIGNATURE类型）
   // 9. 事务更新 field.inserted = true, customText = 值
   // 10. 签名字段创建/更新 Signature 记录
   // 11. 写入 DOCUMENT_FIELD_INSERTED 审计日志
@@ -242,7 +254,7 @@ const createDirectRecipientFieldArgs = await Promise.all(
   fieldsToProcess.map(async (templateField) => {
     // 1. 验证必填字段必须有值
     // 2. NAME字段特殊处理：值作为recipient name
-    // 3. 独立调用 validateFieldAuth (仅签名字段)
+    // 3. 独立调用 validateFieldAuth（仅SIGNATURE类型）
     // 4. 分离签名字段和非签名字段
     // 5. DATE字段自动填充当前时间
     
@@ -284,7 +296,8 @@ export const extractDocumentAuthMethods = ({ documentAuth, recipientAuth }) => {
 |--------|---------|---------|-----------|
 | 创建时访问鉴权 | - (登录态创建) | ✓ (ACCOUNT或无) | ✓ (Presign Token验证) |
 | 签署时访问鉴权 | ✓ (完整支持5种) | - (已在创建时完成) | ✓ (完整支持5种) |
-| 字段动作鉴权 | ✓ (仅签名字段) | ✓ (仅签名字段) | ✓ (仅签名字段) |
+| 字段动作鉴权 | ✓ (仅 SIGNATURE) | ✓ (仅 SIGNATURE) | ✓ (仅 SIGNATURE) |
+| FREE_SIGNATURE鉴权 | ❌ 跳过 | ❌ 跳过 | ❌ 跳过 |
 | 签署顺序控制 | ✓ | ✓ | ✓ |
 | 创建时配置鉴权 | ✓ 继承模板 | ✓ 继承模板 | ❌ 路由不支持传参，创建后需单独更新 |
 
@@ -317,6 +330,7 @@ export const extractDocumentAuthMethods = ({ documentAuth, recipientAuth }) => {
 2. **短时有效**: 默认1小时过期，开发环境可设置为0（立即过期用于测试）
 3. **范围限制**: 支持 `scope` 参数限制令牌权限范围
 4. **无状态验证**: JWT 自包含所有验证信息，验证时不依赖额外数据库查询（除获取API Key）
+5. **动作鉴权粒度**: 仅 `SIGNATURE` 字段受动作鉴权保护，`FREE_SIGNATURE` 与普通文本字段一致
 
 ---
 
@@ -384,6 +398,7 @@ model Recipient {
           │ source=TEMPLATE       │ source=TEMPLATE_DIRECT_LINK│ source=DOCUMENT
           │ authOptions继承模板   │ authOptions继承模板   │ authOptions空数组
           │ 支持传附件            │ 复制模板附件          │ 不支持传附件
+          │ 动作鉴权=仅SIGNATURE  │ 动作鉴权=仅SIGNATURE  │ 动作鉴权=仅SIGNATURE
           │                       │ 创建Signature记录 ✓   │
           │                       │ 写入多类审计日志 ✓     │
           │                       │ 内部触发sendDocument  │
@@ -394,6 +409,7 @@ model Recipient {
                         │   后续签署动作      │
                         │ signFieldWithToken │
                         │ (直链跳过此步)       │
+                        │ 动作鉴权=仅SIGNATURE │
                         └─────────┬───────────┘
                                   │
                                   ▼
@@ -418,19 +434,27 @@ model Recipient {
 ### 9.1 直链签署使用限制
 
 1. **不支持双因素认证**: `TWO_FACTOR_AUTH` 硬编码返回 false，配置了该鉴权的模板无法通过直链签署
-2. **仅签名字段验证动作鉴权**: 其他字段类型绕过动作鉴权
+2. **仅 SIGNATURE 字段验证动作鉴权**: 包括 `FREE_SIGNATURE` 在内的所有其他字段类型都会绕过鉴权检查
 3. **无法中途变更**: 直链签署是原子操作，创建即完成，无法撤销或修改
 4. **版本差异处理**: V2 版本处理只读字段和预填充字段的逻辑不同
 5. **无默认收件人**: 直链签署仅复制模板配置的收件人，不添加团队默认收件人
 
-### 9.2 嵌入预签名关键限制
+### 9.2 动作鉴权关键注意事项
+
+1. **仅 SIGNATURE 受保护**: `validateFieldAuth` 函数只对 `FieldType.SIGNATURE` 执行鉴权检查
+2. **FREE_SIGNATURE 无保护**: 自由签名字段与普通文本字段一样，不执行任何动作鉴权
+3. **所有入口一致**: 模板克隆、直链签署、嵌入签署三种入口都遵循同样的动作鉴权规则
+4. **文档全局配置同样受限**: 即使 `globalActionAuth` 配置了鉴权方式，对非 SIGNATURE 字段也不生效
+
+### 9.3 嵌入预签名关键限制
 
 1. **不支持 authOptions**: `createEmbeddingDocument` 路由入参不包含全局鉴权和收件人鉴权配置，创建后需通过其他API更新
 2. **不支持附件**: 路由入参不包含 attachments 字段，无法在创建文档时上传附件
 3. **内部版本固定**: 强制使用 internalVersion = 1，不支持 V2 版本特性
 4. **单文档数据**: 仅支持单个 envelopeItem（documentDataId），不支持多文档
+5. **动作鉴权规则一致**: 嵌入签署同样仅 SIGNATURE 字段受动作鉴权保护
 
-### 9.3 代码复用率统计（代码核对版）
+### 9.4 代码复用率统计（代码核对版）
 
 | 模块 | 模板克隆 | 直链签署 | 嵌入预签名 |
 |------|---------|---------|-----------|
@@ -439,17 +463,18 @@ model Recipient {
 | Field数据模型 | 100% | 100% | 100% |
 | extractDocumentAuthMethods | 100% | 100% | 100% |
 | isRecipientAuthorized | 100% | ~80% (访问鉴权分支受限) | 100% |
-| validateFieldAuth | 100% | 100% | 100% |
+| validateFieldAuth | 100% (仅SIGNATURE) | 100% (仅SIGNATURE) | 100% (仅SIGNATURE) |
 | signFieldWithToken | 100% | 0% (内部独立实现) | 100% |
 | createEnvelope 公共函数 | 0% (独立实现) | 0% (独立实现) | 100% |
 | PDF复制函数 | putNormalizedPdfFileServerSide | putPdfFileServerSide | N/A (直接引用) |
 | 团队默认收件人 | ✅ 添加 | ❌ 不添加 | ✅ 添加 |
 | 支持鉴权配置 | ✅ 继承模板 | ✅ 继承模板 | ❌ 创建时不支持 |
 | 支持附件 | ✅ | ✅ 仅模板附件 | ❌ |
+| FREE_SIGNATURE鉴权 | ❌ 跳过 | ❌ 跳过 | ❌ 跳过 |
 
 ---
 
-**文档版本**: 2.2  
+**文档版本**: 2.3  
 **最后更新**: 2024  
 **核对状态**: ✅ 所有字段已与源代码逐行核对  
-**关键修正**: 修正嵌入预签名链路 authOptions 描述（路由不支持传参，非调用方可传）、修正 attachments 参数支持状态（不支持）、补充嵌入预签名关键限制章节、统一全文档口径
+**关键修正**: 修正动作鉴权描述（仅SIGNATURE字段执行鉴权，FREE_SIGNATURE直接跳过）、补充动作鉴权矩阵、所有对照表和总结文字完全对齐、全文档口径统一

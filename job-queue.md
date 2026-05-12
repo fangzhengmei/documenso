@@ -2,7 +2,7 @@
 
 ## 概述
 
-Documenso 任务队列系统采用**驱动抽象模式**，支持三种不同的任务执行引擎：本地自建队列、BullMQ（Redis 队列）和 Inngest（第三方托管队列）。系统通过统一的接口层隔离不同驱动的实现细节，实现无缝切换。
+Documenso 任务队列系统采用**驱动抽象模式**，支持三种不同的任务执行引擎：LocalJobProvider（本地自建队列）、BullMQJobProvider（Redis 队列）和 InngestJobProvider（第三方托管队列）。系统通过 `BaseJobProvider` 抽象基类和 `JobClient` 门面隔离不同驱动的实现细节，实现环境变量驱动的无缝切换。
 
 ---
 
@@ -13,6 +13,7 @@ Documenso 任务队列系统采用**驱动抽象模式**，支持三种不同的
 任务定义位于 `packages/lib/jobs/client/_internal/job.ts`，采用 Zod 进行类型安全验证：
 
 ```typescript
+// 代码证据: packages/lib/jobs/client/_internal/job.ts:15-34
 type JobDefinition<Name extends string = string, Schema = any> = {
   id: string;           // 任务唯一标识
   name: string;         // 任务显示名称
@@ -36,9 +37,10 @@ type JobDefinition<Name extends string = string, Schema = any> = {
 
 ### 1.2 JobRunIO 执行上下文
 
-`JobRunIO` 为任务处理提供统一的运行时环境，跨驱动保持一致：
+`JobRunIO` 为任务处理提供统一的运行时环境，跨驱动保持接口签名一致：
 
 ```typescript
+// 代码证据: packages/lib/jobs/client/_internal/job.ts:42-60
 interface JobRunIO {
   // 执行子任务，支持幂等性（通过 cacheKey 去重）
   runTask<T>(cacheKey: string, callback: () => Promise<T>): Promise<T>;
@@ -62,25 +64,22 @@ interface JobRunIO {
 
 ### 1.3 任务定义示例
 
-以发送签名邮件任务为例（`packages/lib/jobs/definitions/emails/send-signing-email.ts`）：
+以发送签名邮件任务为例：
 
 ```typescript
-const SEND_SIGNING_EMAIL_JOB_DEFINITION_ID = 'send.signing.requested.email';
-
-const SEND_SIGNING_EMAIL_JOB_DEFINITION_SCHEMA = z.object({
-  userId: z.number(),
-  documentId: z.number(),
-  recipientId: z.number(),
-  requestMetadata: ZRequestMetadataSchema.optional(),
-});
-
+// 代码证据: packages/lib/jobs/definitions/emails/send-signing-email.ts:17-29
 export const SEND_SIGNING_EMAIL_JOB_DEFINITION = {
-  id: SEND_SIGNING_EMAIL_JOB_DEFINITION_ID,
+  id: 'send.signing.requested.email',
   name: 'Send Signing Email',
   version: '1.0.0',
   trigger: {
-    name: SEND_SIGNING_EMAIL_JOB_DEFINITION_ID,
-    schema: SEND_SIGNING_EMAIL_JOB_DEFINITION_SCHEMA,
+    name: 'send.signing.requested.email',
+    schema: z.object({
+      userId: z.number(),
+      documentId: z.number(),
+      recipientId: z.number(),
+      requestMetadata: ZRequestMetadataSchema.optional(),
+    }),
   },
   handler: async ({ payload, io }) => {
     const handler = await import('./send-signing-email.handler');
@@ -91,14 +90,16 @@ export const SEND_SIGNING_EMAIL_JOB_DEFINITION = {
 
 ### 1.4 任务注册流程
 
-所有任务在 `packages/lib/jobs/client.ts` 中统一注册：
+所有任务在 `packages/lib/jobs/client.ts` 中批量注册到 `JobClient`：
 
 ```typescript
+// 代码证据: packages/lib/jobs/client.ts:29-52
 export const jobsClient = new JobClient([
   SEND_SIGNING_EMAIL_JOB_DEFINITION,
   SEND_CONFIRMATION_EMAIL_JOB_DEFINITION,
   SEAL_DOCUMENT_JOB_DEFINITION,
-  // ... 其他 20+ 个任务定义
+  SEAL_DOCUMENT_SWEEP_JOB_DEFINITION,
+  // ... 共计 20+ 个任务定义
 ] as const);
 ```
 
@@ -108,9 +109,10 @@ export const jobsClient = new JobClient([
 
 ### 2.1 抽象基类设计
 
-位于 `packages/lib/jobs/client/base.ts`，定义所有驱动必须实现的契约：
+`BaseJobProvider` 位于 `packages/lib/jobs/client/base.ts`，定义所有驱动必须实现的契约：
 
 ```typescript
+// 代码证据: packages/lib/jobs/client/base.ts:5-28
 export abstract class BaseJobProvider {
   // 触发任务执行
   public async triggerJob(_options: SimpleTriggerJobOptions): Promise<void> {
@@ -139,6 +141,7 @@ export abstract class BaseJobProvider {
 `JobClient` 类（`packages/lib/jobs/client/client.ts`）通过环境变量动态选择驱动：
 
 ```typescript
+// 代码证据: packages/lib/jobs/client/client.ts:10-41
 export class JobClient<T extends ReadonlyArray<JobDefinition> = []> {
   private _provider: JobClientProvider;
 
@@ -167,40 +170,16 @@ export class JobClient<T extends ReadonlyArray<JobDefinition> = []> {
 }
 ```
 
-### 2.3 三种驱动实现对比
+### 2.3 三种驱动实现对比（代码可证部分）
 
-| 特性 | LocalJobProvider（自建） | BullMQJobProvider | InngestJobProvider（第三方托管） |
-|------|-------------------------|-------------------|--------------------------------|
-| **存储依赖** | PostgreSQL + Prisma | Redis | Inngest 云端 |
-| **调度方式** | HTTP 回调 + 30s 轮询 | Worker 进程消费 | Inngest 云端调度 |
-| **Cron 实现** | 自建轮询 + 幂等 ID | BullMQ 原生 upsertJobScheduler | Inngest 原生 cron |
-| **重试机制** | 数据库状态 + HTTP 重试 | 指数退避 + Redis 持久化 | Inngest 托管重试 |
-| **监控面板** | 无 | Bull Board UI | Inngest Dashboard |
-| **适用场景** | 开发/小规模部署 | 中大规模自托管 | 企业级/不想运维队列 |
-
-### 2.4 驱动单例模式
-
-所有驱动均采用单例模式确保全局唯一实例：
-
-```typescript
-// LocalJobProvider
-static getInstance() {
-  if (!LocalJobProvider._instance) {
-    LocalJobProvider._instance = new LocalJobProvider();
-  }
-  return LocalJobProvider._instance;
-}
-
-// BullMQJobProvider - 使用 globalThis 跨 bundle 共享
-static getInstance() {
-  if (globalThis.__documenso_bullmq_provider__) {
-    return globalThis.__documenso_bullmq_provider__;
-  }
-  const instance = new BullMQJobProvider();
-  globalThis.__documenso_bullmq_provider__ = instance;
-  return instance;
-}
-```
+| 特性 | LocalJobProvider | BullMQJobProvider | InngestJobProvider |
+|------|-----------------|-------------------|--------------------|
+| **实现文件** | `packages/lib/jobs/client/local.ts` | `packages/lib/jobs/client/bullmq.ts` | `packages/lib/jobs/client/inngest.ts` |
+| **单例实现** | `static _instance` 私有静态变量 | `globalThis.__documenso_bullmq_provider__` | `static _instance` 私有静态变量 |
+| **外部依赖** | `@prisma/client` | `bullmq`, `ioredis`, `@bull-board/api` | `inngest` |
+| **triggerJob 落库** | ✅ 调用 `prisma.backgroundJob.create()` | ✅ 调用 `prisma.backgroundJob.create()` | ❌ 代码中无 prisma 调用 |
+| **cron 调度** | ✅ 30秒轮询 + SHA256 幂等 ID | ✅ 调用 `queue.upsertJobScheduler()` | ✅ Inngest createFunction 触发配置 |
+| **监控 UI** | ❌ 无相关代码 | ✅ Bull Board Hono 路由 | ❌ 无 UI 相关代码 |
 
 ---
 
@@ -211,6 +190,7 @@ static getInstance() {
 系统使用 `BackgroundJobStatus` 枚举跟踪任务生命周期：
 
 ```typescript
+// 代码证据: @prisma/client 类型，见各驱动中引用
 enum BackgroundJobStatus {
   PENDING,    // 待执行
   PROCESSING, // 执行中
@@ -222,7 +202,7 @@ enum BackgroundJobStatus {
 ### 3.2 Local 驱动的死信处理流程
 
 ```typescript
-// packages/lib/jobs/client/local.ts:310-346
+// 代码证据: packages/lib/jobs/client/local.ts:273-347
 try {
   await definition.handler({ payload, io });
   // 成功：更新为 COMPLETED
@@ -253,10 +233,16 @@ try {
 }
 ```
 
+**代码可证结论：**
+1. Local 驱动在 HTTP handler 中 catch 所有异常
+2. 根据 `taskHasExceededRetries` 或 `jobHasExceededRetries` 判断是否为最后一次尝试
+3. 最后一次失败更新状态为 `FAILED`，否则重置为 `PENDING` 并重新调用 HTTP 回调
+4. 重试计数存储在 PostgreSQL `BackgroundJob.retried` 字段
+
 ### 3.3 BullMQ 驱动的死信处理流程
 
 ```typescript
-// packages/lib/jobs/client/bullmq.ts:282-298
+// 代码证据: packages/lib/jobs/client/bullmq.ts:265-298
 try {
   await definition.handler({ payload, io });
   if (backgroundJobId) {
@@ -267,7 +253,7 @@ try {
   }
 } catch (error) {
   if (backgroundJobId) {
-    const isFinalAttempt = job.attemptsMade >= DEFAULT_MAX_RETRIES - 1;
+    const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? DEFAULT_MAX_RETRIES) - 1;
     
     // 最后一次尝试失败则标记为 FAILED，否则保持 PENDING
     await prisma.backgroundJob.update({
@@ -276,61 +262,22 @@ try {
         status: isFinalAttempt ? BackgroundJobStatus.FAILED : BackgroundJobStatus.PENDING,
         completedAt: isFinalAttempt ? new Date() : undefined,
       },
-    });
+    }).catch(() => null);
   }
   throw error; // 抛出异常让 BullMQ 处理重试队列
 }
 ```
 
-### 3.4 子任务（runTask）的重试机制
+**代码可证结论：**
+1. BullMQ 驱动 catch 异常但最终重新 `throw error`
+2. 使用 BullMQ 原生的 `job.attemptsMade` 和 `job.opts.attempts` 判断是否为最后一次尝试
+3. 最后一次失败更新数据库状态为 `FAILED`，否则保持 `PENDING`
+4. 重试机制由 BullMQ 本身处理，代码中无显式重试逻辑
 
-每个 `runTask` 内部独立维护重试计数（默认 3 次）：
-
-```typescript
-runTask: async <T>(cacheKey: string, callback: () => Promise<T>) => {
-  const hashedKey = Buffer.from(sha256(cacheKey)).toString('hex');
-  
-  let task = await prisma.backgroundJobTask.findFirst({
-    where: { id: `task-${hashedKey}--${jobId}`, jobId },
-  });
-
-  if (!task) {
-    task = await prisma.backgroundJobTask.create({
-      data: { id: `task-${hashedKey}--${jobId}`, name: cacheKey, jobId, status: PENDING },
-    });
-  }
-
-  if (task.status === COMPLETED) {
-    return task.result as T; // 幂等：已完成则直接返回结果
-  }
-
-  if (task.retried >= 3) {
-    throw new BackgroundTaskExceededRetriesError('Task exceeded retries');
-  }
-
-  try {
-    const result = await callback();
-    await prisma.backgroundJobTask.update({
-      where: { id: task.id, jobId },
-      data: { status: COMPLETED, result, completedAt: new Date() },
-    });
-    return result;
-  } catch (err) {
-    await prisma.backgroundJobTask.update({
-      where: { id: task.id, jobId },
-      data: { status: PENDING, retried: { increment: 1 } },
-    });
-    throw err;
-  }
-}
-```
-
-### 3.5 Inngest 托管队列的失败处理机制
-
-#### 3.5.1 执行流程与状态管理
+### 3.4 Inngest 驱动的失败处理流程
 
 ```typescript
-// packages/lib/jobs/client/inngest.ts:48-61
+// 代码证据: packages/lib/jobs/client/inngest.ts:41-61
 const fn = this._client.createFunction(
   {
     id: job.id,
@@ -346,158 +293,119 @@ const fn = this._client.createFunction(
       payload = job.trigger.schema.parse(payload);
     }
 
-    await job.handler({ payload, io });  // 异常直接抛出给 Inngest
+    await job.handler({ payload, io });  // 无 try-catch，异常直接抛出给 Inngest
   },
 );
 ```
 
-**关键特征**：
-- **无本地状态管理**：Inngest 驱动不创建 `BackgroundJob` 数据库记录，完全依赖 Inngest 云端状态
-- **异常透传**：Handler 抛出的异常直接由 Inngest 平台接管，不经过本地重试逻辑
-- **云端持久化**：任务事件、执行历史、重试记录全部存储在 Inngest 云端
+**代码可证结论：**
+1. Inngest 驱动代码中**无 try-catch** 包裹 handler 调用
+2. 异常直接抛出给 Inngest SDK，由其接管后续处理
+3. 代码中**无任何 prisma.backgroundJob 调用**，任务状态不落本地数据库
+4. 重试、死信、归档等逻辑完全不在仓内代码控制范围内
 
----
+### 3.5 子任务（runTask）的重试机制
 
-### 3.6 三种驱动失败处理对比表
+Local 与 BullMQ 驱动的 `runTask` 实现完全一致（代码相同）：
 
-| 对比维度 | LocalJobProvider | BullMQJobProvider | InngestJobProvider |
-|---------|-----------------|-------------------|--------------------|
-| **重试决策方** | 本地代码逻辑判断 | BullMQ Worker + 本地代码 | Inngest 云端引擎 |
-| **重试配置** | `BackgroundJob.maxRetries` (数据库) | `DEFAULT_MAX_RETRIES = 3` (硬编码) | Inngest Function 配置 |
-| **重试间隔** | 立即重试 (HTTP 回调) | 指数退避 (Redis 延迟队列) | Inngest 托管退避策略 |
-| **死信判定** | 本地 catch 后更新数据库 | 本地 catch + BullMQ attempts 计数 | Inngest 云端自动判定 |
-| **失败后状态** | `BackgroundJobStatus.FAILED` | `BackgroundJobStatus.FAILED` + Redis 死信队列 | Inngest Failed Run |
-| **状态落库** | ✅ 完整落库 (PENDING → PROCESSING → COMPLETED/FAILED) | ✅ 完整落库 (同 Local) | ❌ 不落库，仅 Inngest 云端 |
-| **子任务重试** | ✅ 本地数据库 `backgroundJobTask` 表管理 | ✅ 本地数据库管理 (同 Local) | ✅ Inngest `step.run` 托管 |
-| **子任务幂等** | ✅ SHA256 生成确定性 task ID | ✅ SHA256 生成确定性 task ID | ✅ Inngest Step ID 机制 |
-| **失败日志存储** | 本地 console + 数据库 | 本地 console + 数据库 + Redis | Inngest 云端 Dashboard |
-| **死信可视化** | ❌ 无 UI，需查数据库 | ✅ Bull Board UI | ✅ Inngest Dashboard |
-| **手动重入** | 重置数据库状态为 PENDING | 重置数据库 + BullMQ 重入队 | Inngest Dashboard 点击重试 |
+```typescript
+// 代码证据: packages/lib/jobs/client/bullmq.ts:303-379 (local.ts 类似)
+runTask: async <T extends void | Json>(cacheKey: string, callback: () => Promise<T>) => {
+  const hashedKey = Buffer.from(sha256(cacheKey)).toString('hex');
 
----
+  let task = await prisma.backgroundJobTask.findFirst({
+    where: {
+      id: `task-${hashedKey}--${jobId}`,
+      jobId,
+    },
+  });
 
-### 3.7 失败归档差异分析
+  if (!task) {
+    task = await prisma.backgroundJobTask.create({
+      data: {
+        id: `task-${hashedKey}--${jobId}`,
+        name: cacheKey,
+        jobId,
+        status: BackgroundJobStatus.PENDING,
+      },
+    });
+  }
 
-#### Local 驱动归档
-```
-归档位置：PostgreSQL `BackgroundJob` 表
-归档内容：
-  - jobId / name / version
-  - payload JSON
-  - retried 计数
-  - lastRetriedAt 时间戳
-  - completedAt 失败时间
-  - 关联 backgroundJobTask 子任务记录
-查询方式：直接 SQL 查询
-保留策略：无限期，需手动清理
-```
+  if (task.status === BackgroundJobStatus.COMPLETED) {
+    return task.result as T; // 幂等：已完成则直接返回结果
+  }
 
-#### BullMQ 驱动归档
-```
-双归档模式：
-1. PostgreSQL：同 Local 驱动完整记录
-2. Redis：BullMQ 原生死信队列 (dead letter queue)
-   - Job 完整数据 (name, data, opts)
-   - attemptsMade / failedReason
-   - stacktrace 快照
-查询方式：Bull Board UI + 数据库查询
-保留策略：Redis 按配置过期，数据库无限期
-```
+  if (task.retried >= 3) {
+    throw new Error('Task exceeded retries'); // Local 驱动抛出自定义异常类
+  }
 
-#### Inngest 驱动归档
-```
-归档位置：Inngest 云端 (AWS/GCP 存储)
-归档内容：
-  - 完整 Event 数据
-  - Function 执行 Trace
-  - 每一步 Step 的输入输出
-  - 异常栈追踪
-  - 重试历史时间线
-查询方式：Inngest Dashboard / API
-保留策略：按 Inngest 订阅计划 (默认 30 天)
+  try {
+    const result = await callback();
+    await prisma.backgroundJobTask.update({
+      where: { id: task.id, jobId },
+      data: { status: BackgroundJobStatus.COMPLETED, result, completedAt: new Date() },
+    });
+    return result;
+  } catch (err) {
+    await prisma.backgroundJobTask.update({
+      where: { id: task.id, jobId },
+      data: { status: BackgroundJobStatus.PENDING, retried: { increment: 1 } },
+    });
+    throw err;
+  }
+}
 ```
 
----
+**代码可证结论：**
+1. 子任务 ID 通过 `sha256(cacheKey) + jobId` 确定性生成，保证幂等
+2. 子任务状态完整落库到 `backgroundJobTask` 表
+3. 最大重试次数硬编码为 3 次
+4. Local 驱动抛出 `BackgroundTaskExceededRetriesError` 自定义异常，BullMQ 抛出普通 `Error`
 
-### 3.8 JobRunIO 三种驱动实现差异
+### 3.6 JobRunIO 三种驱动实现差异
 
 虽然接口签名完全一致，但三种驱动的 `JobRunIO` 内部实现存在本质差异：
 
-| JobRunIO 方法 | Local / BullMQ 实现 | Inngest 实现 |
-|--------------|---------------------|-------------|
-| **`runTask`** | ```typescript// 本地数据库幂等实现const hashedKey = sha256(cacheKey);const taskId = `task-${hashedKey}--${jobId}`;// 查询 backgroundJobTask 表// 状态机: PENDING → COMPLETED / FAILED// 重试计数存在数据库``` | ```typescript// Inngest Step 托管await step.run(cacheKey, callback);// 幂等性由 Inngest 保证// Step 状态存在 Inngest 云端// 自动 checkpoint，失败从断点恢复``` |
-| **`triggerJob`** | ```typescript// 直接调用当前 provider 的 triggerJobawait this._provider.triggerJob(payload);// 立即创建 BackgroundJob 记录``` | ```typescript// 调用 Inngest SDK sendEventawait step.sendEvent(cacheKey, payload);// 事件异步持久化到 Inngest// 不创建本地数据库记录``` |
-| **`wait`** | ```typescript// ❌ 未实现，直接抛出错误throw new Error('Not implemented');// 本地队列不支持等待原语``` | ```typescript// ✅ Inngest 原生支持await step.sleep(ms);// 精确时间控制，由云端调度// 不占用进程资源``` |
-| **`logger`** | ```typescript// Node.js console 输出{  info: console.info,  debug: console.debug,  error: console.error,  warn: console.warn,  log: console.log}// 日志仅本地可见``` | ```typescript// Inngest 采集的 Logger{  info: ctx.logger.info,  debug: ctx.logger.debug,  error: ctx.logger.error,  warn: ctx.logger.warn,  log: ctx.logger.info}// 日志同步到云端 Dashboard``` |
-
-#### 差异总结
-
-| 特性 | Local / BullMQ | Inngest |
-|------|---------------|---------|
-| **状态存储** | 本地 PostgreSQL | Inngest 云端 |
-| **断点恢复** | 子任务级别 (数据库) | Step 级别 (云端 checkpoint) |
-| **等待原语** | ❌ 不支持 | ✅ 原生 `step.sleep` |
-| **可观测性** | 本地日志 + 数据库 | 云端 Dashboard + 完整 Trace |
-| **执行原子性** | 任务整体重试 | Step 粒度重试 |
-| **网络依赖** | 数据库连接 | 与 Inngest 的 HTTPS 连接 |
+| JobRunIO 方法 | Local / BullMQ 实现（代码可证） | Inngest 实现（代码可证） |
+|--------------|--------------------------------|--------------------------|
+| **`runTask`** | ```typescript// 本地数据库幂等实现// SHA256 + jobId 生成确定性 task ID// 查询 backgroundJobTask 表// 状态机: PENDING → COMPLETED / FAILED// 重试计数存在数据库，硬编码 3 次// 代码证据: bullmq.ts:303-379``` | ```typescript// Inngest Step 托管await step.run(cacheKey, callback);// 无数据库操作// 代码证据: inngest.ts:98-103``` |
+| **`triggerJob`** | ```typescript// 直接调用当前 provider 的 triggerJob// 立即创建 BackgroundJob 数据库记录// 代码证据: bullmq.ts:368``` | ```typescript// 调用 Inngest SDK sendEventawait step.sendEvent(cacheKey, payload);// 无数据库操作// 代码证据: inngest.ts:105-109``` |
+| **`wait`** | ```typescript// ❌ 未实现，直接抛出错误throw new Error('Not implemented');// 代码证据: bullmq.ts:377-379``` | ```typescript// ✅ Inngest 原生支持await step.sleep(ms);// 代码证据: inngest.ts:90``` |
+| **`logger`** | ```typescript// Node.js console 直接输出{ info: console.info, debug: console.debug, error: console.error, warn: console.warn, log: console.log }// 代码证据: bullmq.ts:369-375``` | ```typescript// Inngest ctx 提供的 Logger{ info: ctx.logger.info, debug: ctx.logger.debug, error: ctx.logger.error, warn: ctx.logger.warn, log: ctx.logger.info }// 代码证据: inngest.ts:91-97``` |
 
 ---
 
-## 四、架构设计总结
+## 四、代码证据边界说明
 
-### 4.1 分层架构
+### 4.1 已确认的代码证据
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                   应用层 (Application)                   │
-│  jobsClient.triggerJob({ name: '...', payload: {...} })  │
-└────────────────────────────┬────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────┐
-│                   JobClient 门面层                       │
-│  - 驱动分发 (ts-pattern match)                          │
-│  - 任务定义批量注册                                      │
-│  - 统一接口封装                                          │
-└────────────────────────────┬────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────┐
-│               BaseJobProvider 抽象基类                   │
-│  triggerJob / defineJob / getApiHandler / startCron     │
-└────────────────────┬───────────┬───────────────────────┘
-                     │           │
-        ┌────────────┘           └────────────┐
-        │                                     │
-┌───────▼────────┐   ┌───────────────┐   ┌──▼───────────┐
-│  LocalProvider │   │  BullMQProvider │   │ InngestProvider │
-│  (自建队列)    │   │  (Redis队列)   │   │  (第三方托管) │
-└────────────────┘   └────────────────┘   └───────────────┘
-```
+| 结论 | 代码位置 | 确认程度 |
+|------|---------|---------|
+| Local/BullMQ 触发任务时创建 BackgroundJob 记录 | `local.ts:200`, `bullmq.ts:139` | ✅ 100% 确认 |
+| Inngest 驱动不创建 BackgroundJob 记录 | `inngest.ts` 全文无 prisma 调用 | ✅ 100% 确认 |
+| Local 驱动重试逻辑在本地代码中实现 | `local.ts:310-347` | ✅ 100% 确认 |
+| BullMQ 重试依赖 throw error + BullMQ 原生机制 | `bullmq.ts:297` | ✅ 100% 确认 |
+| runTask 最大重试次数硬编码为 3 次 | `bullmq.ts:329`, `local.ts:416` | ✅ 100% 确认 |
+| Local/BullMQ 的 wait 方法未实现抛出错误 | `bullmq.ts:377`, `local.ts:463` | ✅ 100% 确认 |
+| BullMQ 最大重试次数 DEFAULT_MAX_RETRIES = 3 | `bullmq.ts:24` | ✅ 100% 确认 |
 
-### 4.2 关键设计决策
+### 4.2 需平台文档确认的内容
 
-| 决策 | 理由 |
-|------|------|
-| **驱动抽象** | 支持按需切换，降低 vendor lock-in |
-| **单例模式** | 避免重复初始化队列连接和调度器 |
-| **Prisma + SHA256** | 实现跨实例任务幂等性（任务 ID 确定性生成） |
-| **Handler 动态 import** | 减少启动时内存占用，支持懒加载 |
-| **统一 JobRunIO** | 跨驱动保持任务代码一致，便于迁移 |
-| **两级重试** | 任务级重试 + 子任务级重试，提供细粒度容错 |
+以下内容**无法**从仓内代码直接推导，需查阅对应平台官方文档：
 
-### 4.3 文件组织结构
+1. **Inngest 重试策略**：重试次数、重试间隔、退避算法、死信处理逻辑
+2. **BullMQ 死信队列**：仓内代码未配置死信队列，是否自动创建需 BullMQ 文档确认
+3. **BullMQ 指数退避参数**：`backoff: { type: 'exponential', delay: 1000 }` 的具体行为需 BullMQ 文档确认
+4. **Inngest 数据保留**：任务历史、日志、Trace 的保留策略需 Inngest 文档确认
+5. **Inngest 断点恢复**：Step 级别的 checkpoint 和恢复机制细节需 Inngest 文档确认
+6. **BullMQ Worker 失败回调**：`_worker.on('failed')` 仅打日志，无其他处理逻辑可证，但后续行为需 BullMQ 文档确认
 
-```
-packages/lib/jobs/
-├── client/
-│   ├── base.ts           # 抽象基类
-│   ├── local.ts          # 本地队列实现
-│   ├── bullmq.ts         # BullMQ 实现
-│   ├── inngest.ts        # Inngest 实现
-│   ├── client.ts         # JobClient 门面
-│   └── _internal/
-│       └── job.ts        # 核心类型定义
-├── definitions/
-│   ├── emails/           # 邮件相关任务
-│   └── internal/         # 内部系统任务
-└── client.ts             # 任务注册与导出
-```
+### 4.3 代码中未体现的实现
+
+以下内容在当前仓内代码中**不存在**，请勿假设已实现：
+
+1. ❌ BullMQ 死信队列配置（无 `deadLetterQueue` 相关代码）
+2. ❌ Local 驱动的重试延迟机制（立即重试无间隔）
+3. ❌ 失败任务的自动告警或通知
+4. ❌ 死信队列的专门管理 UI
+5. ❌ Inngest 的失败回调或 Webhook 配置

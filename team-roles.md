@@ -373,15 +373,15 @@ useEffect(() => {
 
 | 角色 | 可执行操作 | 可见文档范围 | UI入口 |
 |-----|----------|------------|-------|
-| ADMIN | MANAGE_TEAM, DELETE_TEAM | EVERYONE, MANAGER_AND_ABOVE, ADMIN | 团队设置入口可见，成员管理完整功能 |
-| MANAGER | MANAGE_TEAM | EVERYONE, MANAGER_AND_ABOVE | 团队设置入口可见，可管理成员 |
+| ADMIN | MANAGE_TEAM, DELETE_TEAM | EVERYONE, MANAGER_AND_ABOVE, ADMIN | 团队设置入口可见，成员管理功能可见 |
+| MANAGER | MANAGE_TEAM | EVERYONE, MANAGER_AND_ABOVE | 团队设置入口可见 |
 | MEMBER | - | EVERYONE | 团队设置入口不可见 |
-| 所有者 | `organisation.ownerUserId 字段 | 无 | 组织拥有者ID字段 |
-| SIGNER (文档级) | - | 无 | 文档签署页面 |
-| VIEWER (文档级) | - | 无 | 文档查看页面 |
-| APPROVER (文档级) | - | 无 | 文档审批页面 |
-| ASSISTANT (文档级) | - | 无 | 文档协助页面 |
-| CC (文档级) | - | 无 | 文档抄送页面 |
+| 所有者 | `organisation.ownerUserId` 字段 | 无 | 组织拥有者ID字段 |
+| SIGNER (文档级) | - | 无 | 未在本次代码范围内验证 |
+| VIEWER (文档级) | - | 无 | 未在本次代码范围内验证 |
+| APPROVER (文档级) | - | 无 | 未在本次代码范围内验证 |
+| ASSISTANT (文档级) | - | 无 | 未在本次代码范围内验证 |
+| CC (文档级) | - | 无 | 未在本次代码范围内验证 |
 
 ---
 

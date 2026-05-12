@@ -140,12 +140,15 @@ const suffix = isRejected ? '_rejected.pdf' : '_signed.pdf';
 
 ### 3.1 撤回入口：`delete-document.ts`
 
-撤回操作即文档所有者删除文档，分为两种策略：
+撤回操作即文档所有者删除文档，根据文档状态分为三种策略：
 
 | 文档状态 | 删除策略 | 结果 |
 |---------|---------|------|
-| `COMPLETED` | 软删除（Soft Delete） | 设置 `deletedAt` 时间戳，保留记录 |
+| `COMPLETED` | 软删除（Soft Delete） | 设置 `deletedAt` 时间戳，保留完整记录和 PDF |
+| `REJECTED` | 硬删除（Hard Delete） | 直接从数据库删除，含拒签章的 PDF 也会被清理 |
 | `DRAFT/PENDING` | 硬删除（Hard Delete） | 直接从数据库删除 |
+
+> **关键补充**：拒签后的文档（`REJECTED` 状态）虽然已完成密封流程，但不属于 `isDocumentCompleted()` 判断的已完成范围，因此执行硬删除策略。
 
 #### 权限校验
 

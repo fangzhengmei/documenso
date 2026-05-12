@@ -240,16 +240,43 @@ if (userRecipient?.documentDeletedAt === null) {
 
 ### 4.2 撤回通知链
 
-撤回操作触发两类通知：
+撤回操作的通知行为**与删除策略强相关**，软删除和硬删除行为不同：
 
-#### A. 取消邮件（给所有收件人）
+| 删除类型 | 适用状态 | 取消邮件 | Webhook 事件 |
+|---------|---------|---------|-------------|
+| 软删除 | `COMPLETED` | ❌ 不发送 | ✅ 始终触发 `DOCUMENT_CANCELLED` |
+| 硬删除 | `DRAFT/PENDING/REJECTED` | ⚠️ 条件发送（受开关控制） | ✅ 始终触发 `DOCUMENT_CANCELLED` |
+
+#### A. 取消邮件（仅硬删除时条件发送）
 - 模板：`DocumentCancelTemplate`
-- 发送条件：`documentDeleted` 邮件设置开启
+- **发送前提**：仅硬删除流程会走到邮件逻辑，软删除在事务后直接 return，不会发送
+- **邮件开关控制**：硬删除时，通过 `extractDerivedDocumentEmailSettings(envelope.documentMeta).documentDeleted` 二次判断是否发送
+- **关键说明**：不是每次撤回都会发送邮件，两个条件必须同时满足：
+  1. 文档处于 `DRAFT/PENDING/REJECTED` 状态（硬删除分支）
+  2. 文档创建者在「邮件设置」中显式开启了「文档删除通知」
 - 接收范围：已发送且邮箱有效的收件人
+
+```typescript
+// 关键代码流程
+if (isDocumentCompleted(envelope.status)) {
+  // 软删除分支：直接 return，不执行后续邮件发送逻辑
+  return await prisma.$transaction(...); 
+}
+
+// 只有硬删除分支才会走到这里
+const deletedEnvelope = await prisma.$transaction(...);
+
+// 二次判断邮件开关
+const isEnvelopeDeleteEmailEnabled = extractDerivedDocumentEmailSettings(envelope.documentMeta).documentDeleted;
+
+if (!isEnvelopeDeleteEmailEnabled) {
+  return deletedEnvelope; // 开关关闭，仍不发送邮件
+}
+```
 
 #### B. Webhook 事件通知
 - 事件类型：`WebhookTriggerEvents.DOCUMENT_CANCELLED`
-- 触发时机：文档所有者删除后
+- 触发时机：文档所有者删除后（软删除、硬删除都会触发）
 - 接收方：配置的 Webhook 端点
 
 ### 4.3 Webhook 事件映射
@@ -303,10 +330,10 @@ if (userRecipient?.documentDeletedAt === null) {
 | **触发方** | 收件人（签署人） | 文档所有者/团队成员 |
 | **状态变更** | PENDING → REJECTED（通过 Seal） | PENDING/DRAFT/REJECTED → 物理删除<br>COMPLETED → 软删除 |
 | **状态回退范围** | 先更新单个收件人状态，再异步更新整体文档状态 | 直接更新文档状态（删除） |
-| **邮件通知** | 3 类邮件：拒签人确认、所有者通知、其他收件人取消 | 1 类邮件：所有收件人取消通知 |
+| **邮件通知** | 3 类邮件：拒签人确认、所有者通知、其他收件人取消 | 1 类邮件：所有收件人取消通知（受 `documentDeleted` 开关控制，非必发） |
 | **审计日志** | 2 条：收件人拒签 + 文档完成（标记拒签） | 1 条：文档删除 |
 | **Webhook** | `DOCUMENT_REJECTED` | `DOCUMENT_CANCELLED` |
-| **PDF 处理** | 生成带拒签章的 PDF，文件名 `_rejected.pdf` | 不生成新 PDF |
+| **PDF 处理** | 生成带拒签章的 PDF，文件名 `_rejected.pdf` | 不生成新 PDF；拒签后撤回时，已生成的 `_rejected.pdf` 随文档硬删除被清理 |
 | **事务边界** | 收件人状态 + 审计日志 原子事务 | 审计日志 + 文档删除 原子事务 |
 | **异步处理** | 触发 3 个 Job：seal + 两类邮件 | 同步发送邮件 + Webhook |
 

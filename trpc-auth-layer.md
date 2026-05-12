@@ -514,7 +514,144 @@ type ApiRequestMetadata = {
 
 ---
 
-### 4.4 对照时序 B：Authorization 存在但非 OpenAPI 路由（回落场景）
+### 4.4 对照时序 B：API Key 认证（真实 OpenAPI 路由）
+
+以仓库真实的 `fieldRouter.getDocumentField` 路由为例（packages/trpc/server/field-router/router.ts 第 47-76 行）：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: HTTP 请求入口（OpenAPI 端点）                               │
+├─────────────────────────────────────────────────────────────────────┤
+│ 路径: GET /api/v2/document/field/field_123                          │
+│ Headers:                                                            │
+│   - Authorization: Bearer api_abc123def456 (团队 Token)            │
+│   - x-team-id: 99999 (错误团队，会被覆盖)                           │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Context 初始化 (packages/trpc/server/context.ts 第 19-68 行)│
+├─────────────────────────────────────────────────────────────────────┤
+│ getOptionalSession(c) → 无 Cookie → { session: null, user: null }   │
+│                                                                     │
+│ 初始 Context 状态:                                                  │
+│   session: null                                                     │
+│   user: null                                                        │
+│   teamId: 99999 (从 x-team-id header 解析，后续会被覆盖!)           │
+│   req: Request                                                      │
+│   res: Response                                                     │
+│   metadata: { source: 'apiV2', auth: null }                        │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: 路由匹配与 Procedure 分派                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│ 路由定义 (field-router/router.ts 第 47-57 行):                     │
+│   export const getDocumentFieldRoute = authenticatedProcedure       │
+│     .meta({                                                         │
+│       openapi: {                                                     │
+│         method: 'GET',                                              │
+│         path: '/document/field/{fieldId}',  ← meta.openapi.path 存在│
+│         summary: 'Get document field',                              │
+│         tags: ['Document Fields'],                                  │
+│       }                                                             │
+│     })                                                              │
+│     .input(ZGetFieldRequestSchema)                                  │
+│     .output(ZGetFieldResponseSchema)                                │
+│     .query(handler)                                                 │
+│                                                                     │
+│ 关键: isApiV2 = Boolean(meta.openapi.path) = true ✓                │
+│                                                                     │
+│ 分派结果: 触发 authenticatedMiddleware                              │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 4: authenticatedMiddleware 分支判断 (trpc.ts 第 81-125 行)   │
+├─────────────────────────────────────────────────────────────────────┤
+│ 代码第 86 行条件: `if (authorizationHeader && isApiV2)`             │
+│                                                                     │
+│ 实际值:                                                             │
+│   - authorizationHeader = ctx.req.headers.get('authorization')      │
+│     → 'Bearer api_abc123def456' ✓ (存在)                           │
+│   - isApiV2 = Boolean(meta?.openapi?.path) = true ✓ (存在)         │
+│   → 逻辑与结果: true && true = true ✓                               │
+│                                                                     │
+│ ✅ 进入 API Key 认证分支!                                           │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Token 解析与数据库查询 (trpc.ts 第 87-94 行)               │
+├─────────────────────────────────────────────────────────────────────┤
+│ 代码第 88 行 Token 解析:                                            │
+│   const [token] = (authorizationHeader || '')                       │
+│     .split('Bearer ')                                               │
+│     .filter((s) => s.length > 0)                                   │
+│   // token = 'api_abc123def456'                                    │
+│                                                                     │
+│ 代码第 94 行调用 getApiTokenByToken:                                │
+│   const apiToken = await getApiTokenByToken({ token })             │
+│   → 查询 ApiToken 表，验证 token 有效性                             │
+│   → 关联 user 和 team                                              │
+│   → 返回: { id: 'apitok_123', user: User, team: Team | null }      │
+│                                                                     │
+│ 假设返回团队级 Token:                                               │
+│   apiToken = {                                                      │
+│     id: 'apitok_123',                                               │
+│     teamId: 12345,  ← ✅ 正确的团队 ID                              │
+│     team: { id: 12345, name: 'Acme Corp' },  ← 团队信息            │
+│     user: { id: 2002, email: null, name: 'API Bot' }  ← 用户信息   │
+│   }                                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 6: Context 增强与覆盖 (trpc.ts 第 102-124 行)                │
+├─────────────────────────────────────────────────────────────────────┤
+│ 代码第 102-124 行调用 next() 并传入增强 ctx:                        │
+│                                                                     │
+│ ctx.user = apiToken.user    ← 从 API Token 关联的用户               │
+│   → { id: 2002, name: 'API Bot', email: null }                     │
+│                                                                     │
+│ ctx.teamId = apiToken.teamId  ← ❗ 覆盖 x-team-id header 的值!     │
+│   → 12345 (覆盖原 99999)                                            │
+│                                                                     │
+│ ctx.session = null  ← 始终为空，API 认证无会话                      │
+│                                                                     │
+│ 代码第 108-121 行 metadata 赋值:                                    │
+│   ctx.metadata.source = 'apiV2' (保持)                             │
+│   ctx.metadata.auth = 'api'  ← 标记为 API 认证                     │
+│                                                                     │
+│   ctx.metadata.auditUser = apiToken.team  ← 团队级 Token            │
+│     ? { id: null, email: null, name: 'Acme Corp' }                 │
+│     : { id: 2002, email: '...', name: 'API Bot' }                  │
+│   → auditUser: { id: null, email: null, name: 'Acme Corp' }        │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 7: Handler 执行 (field-router/router.ts 第 60-76 行)          │
+├─────────────────────────────────────────────────────────────────────┤
+│ Handler 接收 Context (第 61 行):                                    │
+│   const { teamId } = ctx;  // teamId = 12345 (来自 API Token)      │
+│   ctx.user.id → 2002 (来自 API Token)                               │
+│   ctx.metadata.auth → 'api'                                         │
+│   ctx.metadata.auditUser.name → 'Acme Corp' (审计日志用)           │
+│                                                                     │
+│ 业务逻辑 (第 70-75 行):                                             │
+│   return await getFieldById({                                       │
+│     userId: ctx.user.id,  // 2002                                   │
+│     teamId,              // 12345                                   │
+│     fieldId,                                                       │
+│     envelopeType: EnvelopeType.DOCUMENT,                           │
+│   });                                                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键点**（团队级 API Token）：
+1. `teamId` 完全来自 `apiToken.teamId`，**强制覆盖** `x-team-id` header，防止越权
+2. `auditUser.id/email` 为 `null`，仅保留团队名用于审计追踪
+3. `ctx.session` 始终为 `null`，即使请求同时携带 Cookie
+
+---
+
+### 4.5 对照时序 C：Authorization 存在但非 OpenAPI 路由（回落场景）
 
 这是容易忽略的边界情况：请求带 Authorization header，但路由无 openapi meta：
 
@@ -578,14 +715,22 @@ type ApiRequestMetadata = {
 
 ---
 
-### 4.5 四种场景最终状态对照表
+### 4.6 三条时序最终对照表
 
-| 场景 | ctx.user 来源 | ctx.teamId 来源 | metadata.auth | session 存在 |
-|------|--------------|----------------|---------------|-------------|
-| 会话认证（标准） | Cookie 会话 | x-team-id header | 'session' | ✓ |
-| 匿名访问（maybeAuth + token） | null | undefined | null | ✗ |
-| API Key 认证（OpenAPI 路由） | API Token 关联用户 | API Token.teamId | 'api' | ✗ |
-| 回落场景（有 Authorization 但非 OpenAPI） | Cookie 会话 | x-team-id header | 'session' | ✓ |
+| 维度 | 匿名 maybeAuth<br>(getEnvelopeItemsByToken) | 会话 auth<br>(updateTeamMember) | API Key auth<br>(getDocumentField) |
+|------|-------------------------------------------|----------------------------------|-----------------------------------|
+| **Procedure 类型** | maybeAuthenticatedProcedure | authenticatedProcedure | authenticatedProcedure |
+| **路由 meta.openapi** | 无 → isApiV2 = false | 无 → isApiV2 = false | 有 → isApiV2 = true |
+| **Authorization header** | 无 | 无/有(被忽略) | 有 (Bearer api_xxx) |
+| **触发分支** | 匿名分支（无校验） | 会话认证分支 | API Key 认证分支 |
+| **ctx.session** | null | Session 对象 | null |
+| **ctx.user 来源** | null | Cookie 会话 | getApiTokenByToken 关联 |
+| **ctx.teamId 来源** | undefined | x-team-id header | apiToken.teamId (覆盖 header) |
+| **ctx.metadata.source** | 'app' | 'app' | 'apiV2' |
+| **ctx.metadata.auth** | null | 'session' | 'api' |
+| **ctx.metadata.auditUser** | undefined | { id, email, name } (用户) | 团队级: { id: null, email: null, name: teamName }<br>用户级: { id, email, name } |
+| **Handler 内部行为** | 根据 access.type 决定是否校验 user | 直接使用 ctx.user/teamId (已认证) | 直接使用 ctx.user/teamId (已认证) |
+| **关键代码位置** | trpc.ts 231-249 行 | trpc.ts 134-162 行 | trpc.ts 102-124 行 |
 
 ---
 

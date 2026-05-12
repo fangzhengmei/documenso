@@ -182,7 +182,7 @@ if (isDocumentCompleted(envelope.status)) {
 }
 ```
 
-### 3.3 硬删除流程（草稿/签署中）
+### 3.3 硬删除流程（草稿/签署中/拒签后）
 
 ```typescript
 await prisma.$transaction(async (tx) => {
@@ -301,7 +301,7 @@ if (userRecipient?.documentDeletedAt === null) {
 | 维度 | 拒签（Reject） | 撤回（Recall/Delete） |
 |-----|--------------|---------------------|
 | **触发方** | 收件人（签署人） | 文档所有者/团队成员 |
-| **状态变更** | PENDING → REJECTED（通过 Seal） | PENDING/DRAFT → 物理删除<br>COMPLETED → 软删除 |
+| **状态变更** | PENDING → REJECTED（通过 Seal） | PENDING/DRAFT/REJECTED → 物理删除<br>COMPLETED → 软删除 |
 | **状态回退范围** | 先更新单个收件人状态，再异步更新整体文档状态 | 直接更新文档状态（删除） |
 | **邮件通知** | 3 类邮件：拒签人确认、所有者通知、其他收件人取消 | 1 类邮件：所有收件人取消通知 |
 | **审计日志** | 2 条：收件人拒签 + 文档完成（标记拒签） | 1 条：文档删除 |

@@ -316,65 +316,109 @@ const fn = this._client.createFunction(
 3. 代码中**无任何 prisma.backgroundJob 调用**，任务状态不落本地数据库
 4. 重试、死信、归档等逻辑完全不在仓内代码控制范围内
 
-### 3.5 子任务（runTask）的重试机制
+### 3.5 Local 异常类型与任务级失败判定的关系
 
-Local 与 BullMQ 驱动的 `runTask` 实现完全一致（代码相同）：
+#### 核心异常类型定义
+Local 驱动在 `local.ts:470-479` 定义了两个专用异常类，用于驱动失败判定逻辑：
 
 ```typescript
-// 代码证据: packages/lib/jobs/client/bullmq.ts:303-379 (local.ts 类似)
-runTask: async <T extends void | Json>(cacheKey: string, callback: () => Promise<T>) => {
-  const hashedKey = Buffer.from(sha256(cacheKey)).toString('hex');
-
-  let task = await prisma.backgroundJobTask.findFirst({
-    where: {
-      id: `task-${hashedKey}--${jobId}`,
-      jobId,
-    },
-  });
-
-  if (!task) {
-    task = await prisma.backgroundJobTask.create({
-      data: {
-        id: `task-${hashedKey}--${jobId}`,
-        name: cacheKey,
-        jobId,
-        status: BackgroundJobStatus.PENDING,
-      },
-    });
+// 代码证据: packages/lib/jobs/client/local.ts:470-479
+class BackgroundTaskFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackgroundTaskFailedError';  // 子任务普通失败
   }
+}
 
-  if (task.status === BackgroundJobStatus.COMPLETED) {
-    return task.result as T; // 幂等：已完成则直接返回结果
-  }
-
-  if (task.retried >= 3) {
-    throw new Error('Task exceeded retries'); // Local 驱动抛出自定义异常类
-  }
-
-  try {
-    const result = await callback();
-    await prisma.backgroundJobTask.update({
-      where: { id: task.id, jobId },
-      data: { status: BackgroundJobStatus.COMPLETED, result, completedAt: new Date() },
-    });
-    return result;
-  } catch (err) {
-    await prisma.backgroundJobTask.update({
-      where: { id: task.id, jobId },
-      data: { status: BackgroundJobStatus.PENDING, retried: { increment: 1 } },
-    });
-    throw err;
+class BackgroundTaskExceededRetriesError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackgroundTaskExceededRetriesError';  // 子任务超限失败
   }
 }
 ```
 
-**代码可证结论：**
-1. 子任务 ID 通过 `sha256(cacheKey) + jobId` 确定性生成，保证幂等
-2. 子任务状态完整落库到 `backgroundJobTask` 表
-3. 最大重试次数硬编码为 3 次
-4. Local 驱动抛出 `BackgroundTaskExceededRetriesError` 自定义异常，BullMQ 抛出普通 `Error`
+#### 异常在失败判定中的作用链
 
-### 3.6 JobRunIO 三种驱动实现差异
+| 异常类型 | 抛出位置 | 对任务级判定的影响 |
+|---------|---------|-------------------|
+| **BackgroundTaskExceededRetriesError** | runTask 超限分支 (`local.ts:398`) | ✅ `taskHasExceededRetries` 为 true<br>→ **直接标记任务为 FAILED 死信** |
+| **BackgroundTaskFailedError** | runTask catch 分支 (`local.ts:451`) | ✅ `!(error instanceof BackgroundTaskFailedError)` 为 false<br>→ `jobHasExceededRetries` 判定短路为 false<br>→ **不触发任务级死信，继续重试** |
+| **其他异常** | handler 内其他代码抛出 | ❌ 无特殊处理<br>→ 重试次数达到 maxRetries 后标记 FAILED |
+
+**关键结论（代码可证）：**
+Local 驱动的设计意图是：**runTask 子任务的单次失败不应触发任务级死信，只有子任务连续失败3次才应该终止任务**。通过异常类型区分实现了"子任务重试→任务级重试→子任务超限→任务级失败"的两级重试链条。
+
+---
+
+### 3.6 子任务（runTask）实现与异常路径对照
+
+#### BullMQ 驱动 runTask 完整实现
+```typescript
+// 代码证据: packages/lib/jobs/client/bullmq.ts:303-366
+runTask: async <T extends void | Json>(cacheKey: string, callback: () => Promise<T>) => {
+  const hashedKey = Buffer.from(sha256(cacheKey)).toString('hex');
+
+  let task = await prisma.backgroundJobTask.findFirst({
+    where: { id: `task-${hashedKey}--${jobId}`, jobId },
+  });
+
+  if (!task) { /* 创建 PENDING 任务 */ }
+  if (task.status === COMPLETED) { return task.result as T; }
+  if (task.retried >= DEFAULT_MAX_RETRIES) {
+    throw new Error('Task exceeded retries');  // 普通 Error，无特殊类型
+  }
+
+  try {
+    const result = await callback();
+    await prisma.backgroundJobTask.update({ /* 更新为 COMPLETED */ });
+    return result;
+  } catch (err) {
+    await prisma.backgroundJobTask.update({ /* 重试计数 +1 */ });
+    throw err;  // 直接抛出原始错误，不做包装
+  }
+}
+```
+
+#### Local 驱动 runTask 完整实现
+```typescript
+// 代码证据: packages/lib/jobs/client/local.ts:387-452
+runTask: async <T extends void | Json>(cacheKey: string, callback: () => Promise<T>) => {
+  const hashedKey = Buffer.from(sha256(cacheKey)).toString('hex');
+
+  let task = await prisma.backgroundJobTask.findFirst({
+    where: { id: `task-${hashedKey}--${jobId}`, jobId },
+  });
+
+  if (!task) { /* 创建 PENDING 任务 */ }
+  if (task.status === COMPLETED) { return task.result as T; }
+  if (task.retried >= 3) {
+    throw new BackgroundTaskExceededRetriesError('Task exceeded retries');  // 自定义异常类型
+  }
+
+  try {
+    const result = await callback();
+    await prisma.backgroundJobTask.update({ /* 更新为 COMPLETED */ });
+    return result;
+  } catch (err) {
+    task = await prisma.backgroundJobTask.update({ /* 重试计数 +1 */ });
+    throw new BackgroundTaskFailedError('Task failed');  // 包装为专用异常类型
+  }
+}
+```
+
+#### Local vs BullMQ 异常路径差异总结
+
+| 差异维度 | BullMQ 驱动 | Local 驱动 | 对死信的影响 |
+|---------|------------|-----------|-------------|
+| **超限异常类型** | 普通 `Error` | `BackgroundTaskExceededRetriesError` | BullMQ 中 Error 不会触发特殊判定，Local 中直接触发死信 |
+| **catch 后抛错行为** | `throw err` 原始错误 | 包装为 `BackgroundTaskFailedError` | Local 子任务失败永远不会触发任务级死信（除非超限），BullMQ 任何失败都可能触发 |
+| **任务级异常分支** | 无 | `!(error instanceof BackgroundTaskFailedError)` | Local 有专门逻辑保护子任务重试，BullMQ 无 |
+| **两级重试联动** | 独立不联动 | 子任务重试状态决定任务级失败判定 | 只有 Local 实现了完整的两级重试机制 |
+
+---
+
+### 3.7 JobRunIO 三种驱动实现差异
 
 虽然接口签名完全一致，但三种驱动的 `JobRunIO` 内部实现存在本质差异：
 
@@ -395,11 +439,19 @@ runTask: async <T extends void | Json>(cacheKey: string, callback: () => Promise
 |------|---------|---------|
 | Local/BullMQ 触发任务时创建 BackgroundJob 记录 | `local.ts:200`, `bullmq.ts:139` | ✅ 100% 确认 |
 | Inngest 驱动不创建 BackgroundJob 记录 | `inngest.ts` 全文无 prisma 调用 | ✅ 100% 确认 |
-| Local 驱动重试逻辑在本地代码中实现 | `local.ts:310-347` | ✅ 100% 确认 |
+| Local 驱动失败判定包含 `!(error instanceof BackgroundTaskFailedError)` 分支 | `local.ts:313-314` | ✅ 100% 确认 |
+| BullMQ 驱动无异常类型分支判断 | `bullmq.ts:270` | ✅ 100% 确认 |
+| Local runTask catch 后抛出 `BackgroundTaskFailedError` 包装异常 | `local.ts:451` | ✅ 100% 确认 |
+| BullMQ runTask catch 后直接抛出原始错误 `throw err` | `bullmq.ts:365` | ✅ 100% 确认 |
+| Local 超限抛出 `BackgroundTaskExceededRetriesError` 自定义异常 | `local.ts:398` | ✅ 100% 确认 |
+| BullMQ 超限抛出普通 `Error` | `bullmq.ts:330` | ✅ 100% 确认 |
+| Local runTask update 后重新赋值 `task = await prisma...` | `local.ts:436` | ✅ 100% 确认 |
+| BullMQ runTask update 后无重新赋值直接 throw | `bullmq.ts:350-365` | ✅ 100% 确认 |
 | BullMQ 重试依赖 throw error + BullMQ 原生机制 | `bullmq.ts:297` | ✅ 100% 确认 |
-| runTask 最大重试次数硬编码为 3 次 | `bullmq.ts:329`, `local.ts:416` | ✅ 100% 确认 |
+| runTask 最大重试次数硬编码为 3 次 | `bullmq.ts:329`, `local.ts:397` | ✅ 100% 确认 |
 | Local/BullMQ 的 wait 方法未实现抛出错误 | `bullmq.ts:377`, `local.ts:463` | ✅ 100% 确认 |
 | BullMQ 最大重试次数 DEFAULT_MAX_RETRIES = 3 | `bullmq.ts:24` | ✅ 100% 确认 |
+| 两个驱动都对 result === null 做 Prisma.JsonNull 处理 | `bullmq.ts:356`, `local.ts:407` | ✅ 100% 确认 |
 
 ### 4.2 需平台文档确认的内容
 

@@ -516,7 +516,7 @@ const recipientAuditLogs = auditLogs.filter(log =>
 
 2. **从证书页面提取标识**
    - 提取 `envelopeId`（页脚）
-   - 提取字段 `secondaryId`（签署者详情）
+   - 提取字段 `secondaryId`（Signature ID，字段外部唯一标识）
    - 扫描 QR 码访问公开验证页面
 
 3. **查询审计日志链**

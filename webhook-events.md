@@ -44,8 +44,12 @@ export const ZWebhookDocumentSchema = z.object({
 ```
 
 **实现机制**：
-- 两个字段指向**完全相同的数组对象**（同一个引用）
-- 内容、顺序、元素完全一致
+- **服务端组装阶段**：两个字段指向**完全相同的数组对象**（同一个引用）
+  - 代码位置：`packages/lib/types/webhook-payload.ts:162-163`
+  - 内存中 `Recipient === recipients` 为 `true`
+- **网络传输后**：接收方拿到的 JSON 经过序列化/反序列化，两个字段是**值相同但独立的对象**
+  - `JSON.parse(JSON.stringify(payload)).Recipient !== JSON.parse(JSON.stringify(payload)).recipients`
+- 内容、顺序、元素始终完全一致
 - 唯一区别是字段命名的大小写风格
   - `recipients`：驼峰命名，新 API 标准风格
   - `Recipient`：首字母大写，旧 API 遗留风格
@@ -56,13 +60,14 @@ export const ZWebhookDocumentSchema = z.object({
 |------|------|------|
 | 接收方只读取 `Recipient` | 正常工作 ✅ | 未来此字段可能被废弃 |
 | 接收方只读取 `recipients` | 正常工作 ✅ | 推荐方式 |
-| 接收方同时读取并修改 | 两个字段都会变化 ⚠️ | 外部系统不应该修改 payload |
-| JSON 序列化后反序列化 | 两个字段独立存在 ✅ | 无问题，但增加传输体积 |
+| 服务端内部修改数组元素 | 两个字段都会同步变化 ⚠️ | 仅影响服务端内部逻辑 |
+| 接收方修改任一字段 | 另一字段不受影响 ✅ | JSON 反序列化后对象独立 |
+| JSON 序列化后反序列化 | 两个字段独立存在 ✅ | 增加传输体积，但无功能风险 |
 
 **迁移建议**：
 - 新集成：统一使用 `recipients` 字段
 - 现有系统：尽快从 `Recipient` 迁移到 `recipients`
-- 过渡期间：不要依赖字段的顺序或引用相等性
+- 过渡期间：不要依赖字段的引用相等性（接收端永远不相等）
 
 ---
 

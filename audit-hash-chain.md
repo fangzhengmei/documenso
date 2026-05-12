@@ -339,7 +339,7 @@ export type CertificateRecipient = {
   signingStatus: SigningStatus;
   signatureField?: {
     id: number;
-    secondaryId: string;  // 字段哈希标识
+    secondaryId: string;  // 字段外部唯一标识
     recipientId: number;
     signature?: {
       signatureImageAsBase64: string | null;

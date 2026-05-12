@@ -325,15 +325,121 @@ runTask: async <T>(cacheKey: string, callback: () => Promise<T>) => {
 }
 ```
 
-### 3.5 死信的特征与处理
+### 3.5 Inngest 托管队列的失败处理机制
 
-| 维度 | 说明 |
-|------|------|
-| **死信判定条件** | 1. 任务级重试超过 `maxRetries` <br> 2. 任一子任务重试超过 3 次 |
-| **死信存储** | PostgreSQL `BackgroundJob` 表，`status = FAILED` |
-| **保留信息** | 任务 ID、payload、重试次数、失败时间、关联子任务状态 |
-| **人工干预** | 需查询数据库直接操作，无内置死信队列 UI |
-| **恢复方式** | 重置任务状态为 PENDING 或重新触发同名任务 |
+#### 3.5.1 执行流程与状态管理
+
+```typescript
+// packages/lib/jobs/client/inngest.ts:48-61
+const fn = this._client.createFunction(
+  {
+    id: job.id,
+    name: job.name,
+    optimizeParallelism: job.optimizeParallelism ?? false,
+  },
+  triggerConfig,
+  async (ctx) => {
+    const io = this.convertInngestIoToJobRunIo(ctx);
+    
+    let payload = ctx.event.data as any;
+    if (job.trigger.schema) {
+      payload = job.trigger.schema.parse(payload);
+    }
+
+    await job.handler({ payload, io });  // 异常直接抛出给 Inngest
+  },
+);
+```
+
+**关键特征**：
+- **无本地状态管理**：Inngest 驱动不创建 `BackgroundJob` 数据库记录，完全依赖 Inngest 云端状态
+- **异常透传**：Handler 抛出的异常直接由 Inngest 平台接管，不经过本地重试逻辑
+- **云端持久化**：任务事件、执行历史、重试记录全部存储在 Inngest 云端
+
+---
+
+### 3.6 三种驱动失败处理对比表
+
+| 对比维度 | LocalJobProvider | BullMQJobProvider | InngestJobProvider |
+|---------|-----------------|-------------------|--------------------|
+| **重试决策方** | 本地代码逻辑判断 | BullMQ Worker + 本地代码 | Inngest 云端引擎 |
+| **重试配置** | `BackgroundJob.maxRetries` (数据库) | `DEFAULT_MAX_RETRIES = 3` (硬编码) | Inngest Function 配置 |
+| **重试间隔** | 立即重试 (HTTP 回调) | 指数退避 (Redis 延迟队列) | Inngest 托管退避策略 |
+| **死信判定** | 本地 catch 后更新数据库 | 本地 catch + BullMQ attempts 计数 | Inngest 云端自动判定 |
+| **失败后状态** | `BackgroundJobStatus.FAILED` | `BackgroundJobStatus.FAILED` + Redis 死信队列 | Inngest Failed Run |
+| **状态落库** | ✅ 完整落库 (PENDING → PROCESSING → COMPLETED/FAILED) | ✅ 完整落库 (同 Local) | ❌ 不落库，仅 Inngest 云端 |
+| **子任务重试** | ✅ 本地数据库 `backgroundJobTask` 表管理 | ✅ 本地数据库管理 (同 Local) | ✅ Inngest `step.run` 托管 |
+| **子任务幂等** | ✅ SHA256 生成确定性 task ID | ✅ SHA256 生成确定性 task ID | ✅ Inngest Step ID 机制 |
+| **失败日志存储** | 本地 console + 数据库 | 本地 console + 数据库 + Redis | Inngest 云端 Dashboard |
+| **死信可视化** | ❌ 无 UI，需查数据库 | ✅ Bull Board UI | ✅ Inngest Dashboard |
+| **手动重入** | 重置数据库状态为 PENDING | 重置数据库 + BullMQ 重入队 | Inngest Dashboard 点击重试 |
+
+---
+
+### 3.7 失败归档差异分析
+
+#### Local 驱动归档
+```
+归档位置：PostgreSQL `BackgroundJob` 表
+归档内容：
+  - jobId / name / version
+  - payload JSON
+  - retried 计数
+  - lastRetriedAt 时间戳
+  - completedAt 失败时间
+  - 关联 backgroundJobTask 子任务记录
+查询方式：直接 SQL 查询
+保留策略：无限期，需手动清理
+```
+
+#### BullMQ 驱动归档
+```
+双归档模式：
+1. PostgreSQL：同 Local 驱动完整记录
+2. Redis：BullMQ 原生死信队列 (dead letter queue)
+   - Job 完整数据 (name, data, opts)
+   - attemptsMade / failedReason
+   - stacktrace 快照
+查询方式：Bull Board UI + 数据库查询
+保留策略：Redis 按配置过期，数据库无限期
+```
+
+#### Inngest 驱动归档
+```
+归档位置：Inngest 云端 (AWS/GCP 存储)
+归档内容：
+  - 完整 Event 数据
+  - Function 执行 Trace
+  - 每一步 Step 的输入输出
+  - 异常栈追踪
+  - 重试历史时间线
+查询方式：Inngest Dashboard / API
+保留策略：按 Inngest 订阅计划 (默认 30 天)
+```
+
+---
+
+### 3.8 JobRunIO 三种驱动实现差异
+
+虽然接口签名完全一致，但三种驱动的 `JobRunIO` 内部实现存在本质差异：
+
+| JobRunIO 方法 | Local / BullMQ 实现 | Inngest 实现 |
+|--------------|---------------------|-------------|
+| **`runTask`** | ```typescript// 本地数据库幂等实现const hashedKey = sha256(cacheKey);const taskId = `task-${hashedKey}--${jobId}`;// 查询 backgroundJobTask 表// 状态机: PENDING → COMPLETED / FAILED// 重试计数存在数据库``` | ```typescript// Inngest Step 托管await step.run(cacheKey, callback);// 幂等性由 Inngest 保证// Step 状态存在 Inngest 云端// 自动 checkpoint，失败从断点恢复``` |
+| **`triggerJob`** | ```typescript// 直接调用当前 provider 的 triggerJobawait this._provider.triggerJob(payload);// 立即创建 BackgroundJob 记录``` | ```typescript// 调用 Inngest SDK sendEventawait step.sendEvent(cacheKey, payload);// 事件异步持久化到 Inngest// 不创建本地数据库记录``` |
+| **`wait`** | ```typescript// ❌ 未实现，直接抛出错误throw new Error('Not implemented');// 本地队列不支持等待原语``` | ```typescript// ✅ Inngest 原生支持await step.sleep(ms);// 精确时间控制，由云端调度// 不占用进程资源``` |
+| **`logger`** | ```typescript// Node.js console 输出{  info: console.info,  debug: console.debug,  error: console.error,  warn: console.warn,  log: console.log}// 日志仅本地可见``` | ```typescript// Inngest 采集的 Logger{  info: ctx.logger.info,  debug: ctx.logger.debug,  error: ctx.logger.error,  warn: ctx.logger.warn,  log: ctx.logger.info}// 日志同步到云端 Dashboard``` |
+
+#### 差异总结
+
+| 特性 | Local / BullMQ | Inngest |
+|------|---------------|---------|
+| **状态存储** | 本地 PostgreSQL | Inngest 云端 |
+| **断点恢复** | 子任务级别 (数据库) | Step 级别 (云端 checkpoint) |
+| **等待原语** | ❌ 不支持 | ✅ 原生 `step.sleep` |
+| **可观测性** | 本地日志 + 数据库 | 云端 Dashboard + 完整 Trace |
+| **执行原子性** | 任务整体重试 | Step 粒度重试 |
+| **网络依赖** | 数据库连接 | 与 Inngest 的 HTTPS 连接 |
 
 ---
 

@@ -322,15 +322,33 @@ type ApiRequestMetadata = {
 
 ## 四、请求执行链路时序分析
 
-### 4.1 完整请求执行时序（会话认证模式）
+### 4.1 分支判定矩阵
 
-以下是一次真实 Web 应用请求的完整执行链路（以 `findTeamMembers` 路由为例）：
+根据 `packages/trpc/server/trpc.ts` 第 81-125 行的真实实现，认证分支的判定逻辑如下：
+
+| authorization | meta.openapi.path | session 存在 | 执行分支 | 最终 metadata.auth | 最终 teamId 来源 |
+|--------------|-------------------|-------------|----------|-------------------|------------------|
+| ✓ 存在 | ✓ 存在 | 任意 | **API Key 认证分支** | 'api' | apiToken.teamId (覆盖 header) |
+| ✗ 不存在 | ✗ 不存在 | ✓ 存在 | **会话认证分支** | 'session' | x-team-id header (或 -1) |
+| ✗ 不存在 | ✗ 不存在 | ✗ 不存在 | authenticated → **抛出 UNAUTHORIZED** <br> maybeAuth → **继续匿名** | null | undefined |
+| ✓ 存在 | ✗ 不存在 | ✓ 存在 | **回落到会话认证** | 'session' | x-team-id header (或 -1) |
+| ✓ 存在 | ✗ 不存在 | ✗ 不存在 | authenticated → **抛出 UNAUTHORIZED** <br> maybeAuth → **继续匿名** | null | undefined |
+| ✗ 不存在 | ✓ 存在 | ✓ 存在 | **会话认证分支** (OpenAPI 路由但无 API Key) | 'session' | x-team-id header (或 -1) |
+| ✗ 不存在 | ✓ 存在 | ✗ 不存在 | **抛出 UNAUTHORIZED** | - | - |
+
+**核心规则**（代码第 86 行）：`if (authorizationHeader && isApiV2)` → 只有两个条件**同时满足**才走 API Key 分支，否则回落到会话校验（authenticated）或匿名（maybeAuth）。
+
+---
+
+### 4.2 完整请求执行时序（会话认证模式）
+
+以下是一次真实 Web 应用请求的完整执行链路（以 `updateTeamMember` 路由为例，使用 `authenticatedProcedure`）：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 1: HTTP 请求入口 (Hono Server)                                 │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 路径: POST /api/trpc/team.findTeamMembers                          │
+│ 路径: POST /api/trpc/team.updateTeamMember                         │
 │ Headers:                                                            │
 │   - Cookie: documenso.session=xxx (会话凭证)                        │
 │   - x-team-id: 12345                                                │
@@ -355,87 +373,77 @@ type ApiRequestMetadata = {
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 3: 路由匹配与 Procedure 分派                                  │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 路由定义:                                                           │
-│   export const findTeamMembersRoute = authenticatedProcedure       │
-│     .input(ZFindTeamMembersRequestSchema)                           │
-│     .output(ZFindTeamMembersResponseSchema)                         │
-│     .query(handler)                                                 │
+│ 路由定义 (packages/trpc/server/team-router/updateTeamMember.ts):   │
+│   export const updateTeamMemberRoute = authenticatedProcedure       │
+│     .input(ZUpdateTeamMemberRequestSchema)                          │
+│     .output(ZUpdateTeamMemberResponseSchema)                        │
+│     .mutation(handler)                                              │
 │                                                                     │
-│ 分派结果: 使用 authenticatedProcedure → 触发 authenticatedMiddleware│
+│ 关键: 此路由无 .meta({ openapi: ... }) → meta.openapi.path = undefined│
+│                                                                     │
+│ 分派结果: 触发 authenticatedMiddleware                              │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 4: authenticatedMiddleware 执行分支判断                        │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 判断条件:                                                           │
+│ 代码第 81-86 行判定:                                                │
+│   const authorizationHeader = ctx.req.headers.get('authorization')  │
+│   const isApiV2 = Boolean(meta?.openapi?.path)                      │
+│                                                                     │
+│ 实际值:                                                             │
 │   - authorizationHeader? → undefined (无 API Key)                   │
-│   - isApiV2 = Boolean(meta.openapi.path) → false (非 OpenAPI 路由) │
-│   → 进入【会话认证分支】                                             │
+│   - isApiV2 → Boolean(undefined) → false                            │
+│   → 条件 `authorizationHeader && isApiV2` = false ❌                │
+│   → 跳过 API Key 分支，进入【会话认证校验】                         │
 │                                                                     │
-│ 校验: if (!ctx.session) → 通过，会话存在                            │
+│ 代码第 127-132 行校验:                                              │
+│   if (!ctx.session) → 会话存在，校验通过                            │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│ STEP 5: Context 增强处理                                           │
+│ STEP 5: Context 增强处理（会话模式）                               │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 1. Logger 子实例创建 (带 nonBatchedRequestId)                      │
-│    const trpcSessionLogger = ctx.logger.child({                    │
-│      nonBatchedRequestId: alphaid()  // e.g. 'def456'              │
-│    })                                                               │
+│ 代码第 134-162 行执行:                                              │
 │                                                                     │
-│ 2. Metadata 更新:                                                   │
+│ 1. Logger 子实例创建:                                               │
+│    ctx.logger.child({ nonBatchedRequestId: alphaid() })             │
+│                                                                     │
+│ 2. Metadata 更新 (第 152-160 行):                                  │
 │    ctx.metadata.auth = 'session'                                    │
-│    ctx.metadata.auditUser = {                                       │
-│      id: 1001,                                                      │
-│      name: 'Alice',                                                 │
-│      email: 'alice@documenso.com'                                   │
-│    }                                                                │
+│    ctx.metadata.auditUser = { id: 1001, name: 'Alice', email: '...' }│
 │                                                                     │
-│ 3. Team ID 规范化:                                                  │
-│    ctx.teamId = ctx.teamId || -1  // 12345                         │
+│ 3. Team ID 规范化 (第 148 行):                                      │
+│    ctx.teamId = ctx.teamId || -1  // 12345 (来自 header)            │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│ STEP 6: 业务 Handler 执行 (findTeamMembers)                        │
+│ STEP 6: 业务 Handler 执行                                          │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Handler 可访问的最终 Context 状态:                                  │
+│ Handler 接收的最终 Context:                                         │
+│   ctx.user → { id: 1001, name: 'Alice', email: 'alice@documenso.com' }│
+│   ctx.teamId → 12345 (来自 x-team-id header)                        │
+│   ctx.session → Session 对象                                        │
+│   ctx.metadata.auth → 'session'                                     │
 │                                                                     │
-│  ctx = {                                                            │
-│    logger: LoggerChild({                                            │
-│      ipAddress: '192.168.1.1',                                      │
-│      userAgent: 'Chrome/120.0',                                     │
-│      requestId: 'abc123',        // Hono 层请求 ID                  │
-│      nonBatchedRequestId: 'def456'  // tRPC 子请求 ID               │
-│    })                                                               │
-│    session: Session { id: 'sess_xxx', userId: 1001, ... }          │
-│    user: { id: 1001, name: 'Alice', email: 'alice@documenso.com' } │
-│    teamId: 12345                                                    │
-│    req: Request                                                     │
-│    res: Response                                                    │
-│    metadata: {                                                      │
-│      source: 'app',                                                 │
-│      auth: 'session',                                               │
-│      auditUser: { id: 1001, name: 'Alice', email: '...' }          │
-│    }                                                                │
-│  }                                                                  │
-│                                                                     │
-│ 业务逻辑: 使用 ctx.user.id 和 ctx.teamId 进行数据库查询...         │
+│ 业务逻辑: 调用 buildTeamWhereQuery + getMemberRoles 校验权限...    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-### 4.2 对照时序 A：匿名访问（maybeAuthenticatedProcedure）
+### 4.3 对照时序 A：匿名 token 访问（真实 maybeAuthenticatedProcedure）
 
-以公开文档查看路由为例，使用 `maybeAuthenticatedProcedure`：
+以仓库真实的 `getEnvelopeItemsByTokenRoute` 路由为例（packages/trpc/server/envelope-router/get-envelope-items-by-token.ts）：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 1: HTTP 请求入口                                               │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 路径: POST /api/trpc/document.getPublicDocument                     │
+│ 路径: POST /api/trpc/envelope.getEnvelopeItemsByToken              │
 │ Headers: 无 Cookie，无 Authorization                                 │
 │          x-team-id: 无                                              │
+│ Body: { envelopeId: 'env_xxx', access: { type: 'recipient', token: 'tok_xxx' } }│
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -452,141 +460,132 @@ type ApiRequestMetadata = {
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 3: Procedure 分派 → maybeAuthenticatedProcedure              │
+├─────────────────────────────────────────────────────────────────────┤
+│ 路由定义 (第 15 行):                                                │
+│   export const getEnvelopeItemsByTokenRoute = maybeAuthenticatedProcedure│
+│                                                                     │
+│ 关键: 无 .meta({ openapi: ... }) → isApiV2 = false                 │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 4: maybeAuthenticatedMiddleware 执行                          │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 判断条件:                                                           │
+│ 代码第 179-223 行判定:                                              │
+│   const authorizationHeader = ctx.req.headers.get('authorization')  │
+│   const isApiV2 = Boolean(meta?.openapi?.path)                      │
+│                                                                     │
+│ 实际值:                                                             │
 │   - authorizationHeader? → undefined                                │
-│   - isApiV2? → false                                                │
-│   → 无认证信息，保留匿名状态                                        │
+│   - isApiV2 → false                                                 │
+│   → 条件 `authorizationHeader && isApiV2` = false ❌                │
+│   → 跳过 API Key 分支                                               │
 │                                                                     │
-│ 不抛出异常！这是与 authenticatedMiddleware 的核心区别               │
-│                                                                     │
-│ Context 状态保持:                                                   │
-│   session: null                                                     │
-│   user: null                                                        │
-│   metadata.auth: null                                               │
-│   metadata.auditUser: undefined                                     │
+│ 代码第 225-249 行: 不校验 session! 直接继续执行                    │
+│   ❗ 与 authenticatedMiddleware 核心区别: 无 if (!ctx.session) throw│
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│ STEP 5: Handler 执行（匿名模式）                                    │
+│ STEP 5: Context 增强（匿名模式）                                   │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Handler 接收 Context:                                               │
-│   ctx.user → null  ❗ 业务代码必须处理 user 为 null 的情况          │
-│   ctx.teamId → undefined                                            │
-│   ctx.metadata.auth → null                                          │
+│ 代码第 231-248 行执行:                                              │
+│   ctx.metadata.auth = ctx.session ? 'session' : null  → null        │
+│   ctx.metadata.auditUser = ctx.user ? { ... } : undefined → undefined│
+│   ctx.teamId = undefined (保持原值)                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 6: Handler 执行（匿名 token 访问）                            │
+├─────────────────────────────────────────────────────────────────────┤
+│ Handler 接收 Context (第 19 行):                                    │
+│   const { teamId, user } = ctx;  // teamId = undefined, user = null│
 │                                                                     │
-│ 业务逻辑: 仅返回公开文档信息，不返回任何用户私有数据                 │
+│ 业务逻辑 (第 30-56 行):                                             │
+│   if (access.type === 'user') {                                     │
+│     // 需要认证: 手动校验 user/teamId                               │
+│     if (!user || !teamId) throw new AppError(UNAUTHORIZED);         │
+│   } else {                                                          │
+│     // 匿名访问: 通过 recipient token 查询，不校验用户              │
+│     return handleGetEnvelopeItemsByToken(envelopeId, access.token); │
+│   }                                                                 │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**关键点**：`maybeAuthenticatedProcedure` 允许 `ctx.user` 为 `null`，业务 Handler 必须自行处理匿名访问逻辑。
+**关键点**：`maybeAuthenticatedProcedure` 不强制认证，但业务 Handler 可根据访问类型**自行决定**是否需要认证。
 
 ---
 
-### 4.3 对照时序 B：API Key 认证（OpenAPI 路由）
+### 4.4 对照时序 B：Authorization 存在但非 OpenAPI 路由（回落场景）
 
-以 API V2 文档列表查询为例：
+这是容易忽略的边界情况：请求带 Authorization header，但路由无 openapi meta：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 1: HTTP 请求入口                                               │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 路径: GET /api/v2/documents                                         │
+│ 路径: POST /api/trpc/team.updateTeamMember                         │
 │ Headers:                                                            │
-│   - Authorization: Bearer api_abc123def456                         │
-│   - x-team-id: 67890                                                │
+│   - Authorization: Bearer api_abc123def456 (误传)                  │
+│   - Cookie: documenso.session=xxx (同时存在会话)                    │
+│   - x-team-id: 12345                                                │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ STEP 2: Context 初始化                                              │
 ├─────────────────────────────────────────────────────────────────────┤
-│ getOptionalSession(c) → { session: null, user: null }              │
-│                                                                     │
-│ 初始 Context:                                                       │
-│   session: null                   ❗ 会话为空                       │
-│   user: null                      ❗ 用户为空                       │
-│   teamId: 67890 (从 header 解析，后续会被 API Token 覆盖)           │
-│   metadata: { source: 'apiV2', auth: null }                        │
+│ getOptionalSession(c) → 从 Cookie 解析会话成功                       │
+│   session: Session { id: 'sess_xxx', userId: 1001 }                │
+│   user: { id: 1001, name: 'Alice', ... }                            │
+│   teamId: 12345 (从 header 解析)                                    │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│ STEP 3: Procedure 分派 → authenticatedProcedure                   │
-└─────────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│ STEP 4: authenticatedMiddleware 执行 → API Key 分支               │
+│ STEP 3: 路由匹配 → authenticatedProcedure                         │
 ├─────────────────────────────────────────────────────────────────────┤
-│ 判断条件:                                                           │
-│   - authorizationHeader? → 'Bearer api_abc123def456' ✓             │
-│   - isApiV2 = Boolean(meta.openapi.path) → true ✓                  │
-│   → 进入【API Key 认证分支】                                         │
-│                                                                     │
-│ Token 解析:                                                         │
-│   const [token] = authorization.split('Bearer ').filter(Boolean)   │
-│   // token = 'api_abc123def456'                                    │
-│                                                                     │
-│ 数据库查询: getApiTokenByToken({ token })                           │
-│   → 查找有效的 API Token 记录                                       │
-│   → 关联 user 和 team                                              │
+│ 关键: updateTeamMember 路由无 .meta({ openapi: ... })              │
+│       → meta.openapi.path = undefined                               │
+│       → isApiV2 = Boolean(undefined) = false                        │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│ STEP 5: Context 增强（API Key 模式）                               │
+│ STEP 4: authenticatedMiddleware 分支判断 ❗ 重要                   │
 ├─────────────────────────────────────────────────────────────────────┤
-│  ctx = {                                                            │
-│    ...                                                              │
-│    user: apiToken.user          ❗ 从 API Token 关联的用户          │
-│    teamId: apiToken.teamId      ❗ 覆盖 header 中的 teamId         │
-│    session: null                 ❗ 始终为 null                     │
-│    metadata: {                                                      │
-│      source: 'apiV2',                                               │
-│      auth: 'api',               ✅ 标记为 API 认证                  │
-│      auditUser: {                                                   │
-│        id: apiToken.team ? null : apiToken.user.id,                 │
-│        email: apiToken.team ? null : apiToken.user.email,           │
-│        name: apiToken.team?.name ?? apiToken.user.name              │
-│      }                                                              │
-│    }                                                                │
-│  }                                                                  │
+│ 代码第 86 行条件: `if (authorizationHeader && isApiV2)`             │
 │                                                                     │
-│ 注意: 如果是团队级 API Token，auditUser.id/email 为 null            │
+│ 实际值:                                                             │
+│   - authorizationHeader → 'Bearer api_abc123def456' ✓ (存在)       │
+│   - isApiV2 → false ✗ (不存在)                                     │
+│   → 逻辑与结果: true && false = false                               │
+│                                                                     │
+│ ❗ 结果: 跳过 API Key 分支，回落到会话认证分支!                     │
+│        Authorization header 被完全忽略!                            │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
-│ STEP 6: Handler 执行（API 模式）                                   │
+│ STEP 5: 会话认证分支执行                                            │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Handler 接收 Context:                                               │
-│   ctx.user → { id: 2002, name: 'API Bot', email: 'api@documenso.com' }│
-│   ctx.teamId → 67890 (来自 API Token)                              │
-│   ctx.session → null                                               │
-│   ctx.metadata.auth → 'api'                                        │
+│ 代码第 127 行校验: if (!ctx.session) → 通过，会话存在               │
 │                                                                     │
-│ 业务逻辑: 与会话认证一致，但通过 ctx.metadata.auth 区分审计来源    │
+│ 最终 Context 状态:                                                  │
+│   ctx.user → { id: 1001, ... } (来自 Cookie 会话，非 API Token)    │
+│   ctx.teamId → 12345 (来自 x-team-id header，非 API Token)          │
+│   ctx.metadata.auth → 'session' (不是 'api'!)                       │
+│                                                                     │
+│ ❗ 注意: API Token 未被查询、未被验证、完全被丢弃!                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**关键点**：
-1. 即使有会话 Cookie，只要提供 Authorization header + OpenAPI meta，优先走 API Key 认证
-2. API Token 中的 teamId 会覆盖 x-team-id header，防止越权访问
-3. 团队级 API Token 的 auditUser.id/email 为 null，仅保留团队名用于审计
+**关键结论**：只有**同时满足** `Authorization header 存在` + `路由定义了 meta.openapi.path`，才会走 API Key 认证。缺少任一条件，Authorization header 会被静默忽略。
 
 ---
 
-### 4.4 三种入口最终状态对比表
+### 4.5 四种场景最终状态对照表
 
-| 字段 | 公开访问 (procedure) | 匿名访问 (maybeAuth) | 会话认证 (authed) | API Key 认证 (authed) |
-|------|---------------------|---------------------|-------------------|----------------------|
-| ctx.session | null / Session | null | Session | null |
-| ctx.user | null / User | null | User | User |
-| ctx.teamId | undefined | undefined | number (from header) | number (from token) |
-| ctx.metadata.source | 'app' / 'apiV2' | 'app' | 'app' | 'apiV2' |
-| ctx.metadata.auth | null | null | 'session' | 'api' |
-| ctx.metadata.auditUser | undefined | undefined | { id, name, email } | { id?, name, email? } |
-| 认证失败行为 | - | 继续执行 | 抛出 UNAUTHORIZED | 抛出 UNAUTHORIZED |
+| 场景 | ctx.user 来源 | ctx.teamId 来源 | metadata.auth | session 存在 |
+|------|--------------|----------------|---------------|-------------|
+| 会话认证（标准） | Cookie 会话 | x-team-id header | 'session' | ✓ |
+| 匿名访问（maybeAuth + token） | null | undefined | null | ✗ |
+| API Key 认证（OpenAPI 路由） | API Token 关联用户 | API Token.teamId | 'api' | ✗ |
+| 回落场景（有 Authorization 但非 OpenAPI） | Cookie 会话 | x-team-id header | 'session' | ✓ |
 
 ---
 
@@ -626,7 +625,7 @@ export const authenticatedMiddleware = (handler) => {
 
 ---
 
-## 五、关键设计模式总结
+## 六、关键设计模式总结
 
 1. **数据库层权限过滤优先**：通过 `buildTeamWhereQuery` 在查询层面就过滤掉无权限数据，避免后续校验遗漏
 

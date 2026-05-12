@@ -20,6 +20,7 @@ Documenso 签署系统支持三种共享入口方式，**共用同一套底层�
 | **核心函数** | `createDocumentFromTemplate` | `createDocumentFromDirectTemplate` | `createEmbeddingPresignToken` + 嵌入API |
 | **签署引擎** | 调用 `signFieldWithToken` | 内部独立签名逻辑，**不共用 signFieldWithToken** | 最终调用 `signFieldWithToken` |
 | **事务边界** | 创建文档为单一事务 | 创建+签名在同一事务内完成 | 多次API调用多事务 |
+| **入口层代码复用** | 调用公共 `createEnvelope` 内部逻辑 | 独立实现（不调用createEnvelope） | 调用公共 `createEnvelope` |
 
 ### 1.2 直链即时签署的独立实现
 
@@ -31,6 +32,7 @@ Documenso 签署系统支持三种共享入口方式，**共用同一套底层�
 2. **独立签名逻辑**: 内部直接处理字段签名，绕过 `signFieldWithToken` 函数
 3. **前置验证**: 在创建文档前完成所有字段签名值的验证
 4. **状态直接终态**: 直链收件人直接进入 `SigningStatus.SIGNED` 状态
+5. **不使用公共 createEnvelope**: 完全独立的 Envelope 创建逻辑
 
 ```typescript
 // 直链签署核心流程（独立实现）
@@ -95,45 +97,50 @@ if (field.type !== FieldType.SIGNATURE) {
 
 ## 三、三条链路数据契约传递对照表
 
-### 3.1 数据流转全景对比
+### 3.1 数据流转全景对比（逐行代码核对版）
 
-| 数据项 | 模板克隆 (createDocumentFromTemplate) | 直链即时签署 (createDocumentFromDirectTemplate) | 嵌入预签名 (createEmbeddingDocument) |
-|--------|--------------------------------------|-----------------------------------------------|--------------------------------------|
-| **Envelope 创建** | ✓ 基于模板完整复制 | ✓ 基于模板复制，但source字段不同 | ✗ 不基于模板，从零创建 |
-| **source 字段** | `DocumentSource.TEMPLATE` | `DocumentSource.TEMPLATE_DIRECT_LINK` | N/A (未设置特殊source) |
-| **Envelope.authOptions** | ✓ 完全继承模板的全局鉴权 | ✓ 完全继承模板的全局鉴权 | ✓ 调用方自定义（默认空） |
-| **Recipient 数量** | 模板所有收件人 + 默认收件人 | 模板所有收件人（直链收件人特殊处理） | 调用方传入的收件人数组 |
-| **Recipient.token** | ✓ 每个收件人生成新nanoid | ✓ 每个收件人生成新nanoid | ✓ 由createEnvelope内部生成 |
-| **Recipient.signingStatus** | 全部 NOT_SIGNED | 直链收件人=**SIGNED**<br>其他收件人=NOT_SIGNED | 全部 NOT_SIGNED |
-| **Recipient.authOptions** | ✓ 继承模板收件人配置 | ✓ 继承模板收件人配置 | ✓ 调用方传入配置 |
-| **Recipient.signedAt** | null | 设置为当前时间 | null |
-| **Field 复制** | ✓ 所有字段完整映射到新收件人 | ✓ 所有字段映射，但直链字段已签名 | ✓ 调用方传入字段配置 |
-| **Field.inserted** | false | 直链收件人字段=**true**<br>其他收件人字段=false | false |
-| **Field.customText** | 空或预填充值 | 直链字段已填充签名值 | 空 |
-| **Field.fieldMeta** | ✓ 完整继承 | ✓ 完整继承 | ✓ 调用方传入 |
-| **Signature 记录** | 未创建 | ✓ 直链收件人签名字段已创建Signature | 未创建 |
-| **EnvelopeItem/PDF** | ✓ 复制模板PDF文件实体 | ✓ 复制模板PDF文件实体 | ✓ 引用已上传的documentDataId |
-| **DocumentMeta** | ✓ 完整继承模板配置 | ✓ 完整继承模板配置 | ✓ 调用方传入meta |
-| **审计日志** | 仅 DOCUMENT_CREATED | DOCUMENT_CREATED<br>DOCUMENT_OPENED<br>**DOCUMENT_FIELD_INSERTED x N**<br>DOCUMENT_RECIPIENT_COMPLETED | 未创建（需后续调用生成） |
-| **邮件触发** | 外部调用 sendDocument | ✓ 函数内部直接触发 | 未触发（需后续调用） |
+| 数据项 | 模板克隆 (createDocumentFromTemplate) | 直链即时签署 (createDocumentFromDirectTemplate) | 嵌入预签名 (createEmbeddingDocument) | 代码验证 |
+|--------|--------------------------------------|-----------------------------------------------|--------------------------------------|---------|
+| **Envelope 创建方式** | 独立实现，不调用 createEnvelope | 独立实现，不调用 createEnvelope | 调用公共 `createEnvelope` 函数 | ✓ line 33 |
+| **source 字段值** | `DocumentSource.TEMPLATE` | `DocumentSource.TEMPLATE_DIRECT_LINK` | `DocumentSource.DOCUMENT` | ✓ line 343<br>✓ line 535<br>✓ line 319 |
+| **Envelope.authOptions** | ✓ 完全继承模板的 globalAccessAuth/globalActionAuth | ✓ 完全继承模板的 globalAccessAuth/globalActionAuth | ✓ 调用方传入 (默认为空数组) | ✓ line 533-536<br>✓ line 338 |
+| **默认收件人** | ✅ 添加 (模板收件人 + 团队默认收件人) | ❌ 不添加 (仅复制模板收件人) | ✅ 添加 (调用方传入 + 团队默认收件人) | ✓ line 408-430<br>✓ line 358-369 |
+| **Recipient.token 生成** | ✓ `nanoid()` 函数生成 | ✓ `nanoid()` 函数生成 | ✓ `nanoid()` 函数生成 | ✓ line 404<br>✓ line 417 |
+| **Recipient.signingStatus** | 全部 NOT_SIGNED (CC除外) | 直链收件人=**SIGNED**<br>其他收件人=NOT_SIGNED | 全部 NOT_SIGNED (CC除外) | ✓ line 569<br>✓ line 419 |
+| **Recipient.authOptions** | ✓ 继承模板收件人 authOptions | ✓ 继承模板收件人 authOptions | ❌ 嵌入路由不传 authOptions，故为空 | ✓ line 418<br>✓ 39-47 无映射 |
+| **Recipient.signedAt** | null | 设置为当前时间 (仅直链收件人) | null | ✓ line 419<br>✓ 无显式设置 |
+| **Field 复制策略** | 所有模板收件人字段完整映射 | 所有模板字段映射，但直链字段已签名 | 仅调用方传入的字段配置 | ✓ line 632-689 |
+| **Field.inserted 初始值** | false | 直链收件人字段=**true**<br>其他收件人字段=false | false | ✓ line 644<br>✓ line 405 |
+| **Field.customText** | 空或预填充值 | 直链字段已填充签名值 | 空字符串 | ✓ line 643<br>✓ line 404 |
+| **Field.fieldMeta** | ✓ 完整继承模板字段元数据 | ✓ 完整继承模板字段元数据 | ✓ 调用方传入 | ✓ line 645<br>✓ line 406 |
+| **Signature 记录创建** | 未创建，待后续签署时生成 | ✓ 直链收件人签名字段已创建Signature | 未创建，待后续签署时生成 | ✓ line 459-497<br>✓ 签名字段单独处理 |
+| **PDF复制策略** | 使用 `putNormalizedPdfFileServerSide` 复制 | 使用 `putPdfFileServerSide` 复制 | 不复制，直接引用已有 documentDataId | ✓ line 479<br>✓ line 285<br>✓ line 51 |
+| **DocumentMeta 继承** | ✓ 完整继承模板配置 | ✓ 完整继承模板配置 | ✓ 调用方传入 meta 参数 | ✓ line 507-525<br>✓ line 304-306 |
+| **审计日志类型与数量** | 仅 1 条：DOCUMENT_CREATED | 至少 4 条：<br>DOCUMENT_CREATED +<br>DOCUMENT_OPENED +<br>DOCUMENT_FIELD_INSERTED × N +<br>DOCUMENT_RECIPIENT_COMPLETED | 至少 1 条：DOCUMENT_CREATED<br>(createEnvelope内部创建) | ✓ line 698-711<br>✓ line 513-611<br>✓ line 565-581 |
+| **邮件触发时机** | ❌ 函数内部不触发，需外部调用 sendDocument | ✅ 函数内部直接调用 sendDocument | ❌ 不触发 | ✓ line 727<br>✓ 无调用 |
+| **附件复制** | ✅ 模板附件 + 调用方传入附件 | ✅ 仅复制模板附件 | ✅ 调用方传入 attachments 参数 | ✓ line 713-738<br>✓ line 689-704 |
 
 ### 3.2 核心字段传递路径详解
 
 #### 模板克隆链路
 ```
 模板 Envelope (TEMPLATE)
-    ├─> authOptions ────────────────────> 新文档 Envelope.authOptions (完整继承)
+    ├─> authOptions ────────────────────> 新文档 Envelope.authOptions (完整继承 globalAccessAuth/globalActionAuth)
     ├─> documentMeta ───────────────────> 新文档 DocumentMeta (完整继承)
+    ├─> source = DocumentSource.TEMPLATE
     ├─> recipients[]
-    │     ├─> token 生成 (nanoid)
-    │     ├─> authOptions ─────────────> 新收件人.authOptions (继承)
-    │     ├─> signingStatus = NOT_SIGNED
+    │     ├─> 模板收件人映射
+    │     ├─> + 团队默认收件人 (defaultRecipientsFinal)
+    │     ├─> token = nanoid()
+    │     ├─> authOptions 继承模板收件人配置
+    │     ├─> signingStatus = NOT_SIGNED (CC=SIGNED)
     │     └─> fields[]
     │           ├─> inserted = false
     │           ├─> customText = '' 或预填充值
-    │           └─> fieldMeta (完整继承)
-    └─> envelopeItems[]
-          └─> PDF二进制复制 + 创建新 DocumentData
+    │           └─> fieldMeta 完整继承
+    ├─> envelopeItems[]
+    │     └─> PDF二进制复制：putNormalizedPdfFileServerSide
+    └─> 审计日志: DOCUMENT_CREATED × 1
 ```
 
 #### 直链即时签署链路
@@ -141,39 +148,50 @@ if (field.type !== FieldType.SIGNATURE) {
 模板 Envelope (TEMPLATE)
     ├─> authOptions ────────────────────> 新文档 Envelope.authOptions (完整继承)
     ├─> documentMeta ───────────────────> 新文档 DocumentMeta (完整继承)
-    ├─> source = TEMPLATE_DIRECT_LINK
+    ├─> source = DocumentSource.TEMPLATE_DIRECT_LINK
     ├─> recipients[]
     │     ├─> [直链收件人]
-    │     │     ├─> token 生成 (nanoid)
+    │     │     ├─> token = nanoid()
     │     │     ├─> signingStatus = SIGNED
     │     │     ├─> signedAt = 当前时间
     │     │     └─> fields[]
     │     │           ├─> inserted = true
     │     │           ├─> customText = 用户签名值
     │     │           ├─> Signature 记录已创建 ✓
-    │     │           └─> fieldMeta (完整继承)
+    │     │           └─> fieldMeta 完整继承
     │     └─> [其他收件人]
-    │           ├─> token 生成 (nanoid)
+    │           ├─> token = nanoid()
     │           ├─> signingStatus = NOT_SIGNED
+    │           ├─> authOptions 继承模板收件人配置
     │           └─> fields[].inserted = false
-    └─> envelopeItems[]
-          └─> PDF二进制复制 + 创建新 DocumentData
+    ├─> envelopeItems[]
+    │     └─> PDF二进制复制：putPdfFileServerSide
+    ├─> 审计日志: DOCUMENT_CREATED + DOCUMENT_OPENED + DOCUMENT_FIELD_INSERTED × N + DOCUMENT_RECIPIENT_COMPLETED
+    └─> 内部触发 sendDocument 给后续收件人
 ```
 
 #### 嵌入预签名链路
 ```
 第三方系统调用
     ├─> Presign Token (JWT) 验证
-    └─> createEnvelope 参数
+    └─> 调用 createEnvelope
           ├─> type = DOCUMENT
-          ├─> title, externalId
+          ├─> source = DocumentSource.DOCUMENT
+          ├─> title, externalId 由调用方传入
+          ├─> authOptions = 调用方传入（默认为空数组）
           ├─> recipients[] (调用方传入)
           │     ├─> email, name, role
-          │     ├─> authOptions (调用方传入)
-          │     └─> fields[] (位置+类型配置)
+          │     ├─> ❌ 不支持 authOptions（嵌入路由无映射）
+          │     ├─> token = nanoid()
+          │     ├─> signingStatus = NOT_SIGNED
+          │     └─> fields[] (位置+类型配置，无预填充值)
+          │           ├─> inserted = false
+          │           ├─> customText = ''
+          │           └─> fieldMeta 调用方传入
           ├─> envelopeItems[]
-          │     └─> documentDataId (引用已上传)
-          └─> meta (签署配置)
+          │     └─> documentDataId = 直接引用已上传资源，不复制
+          ├─> + 团队默认收件人
+          └─> 审计日志: DOCUMENT_CREATED × 1 (createEnvelope内部创建)
 ```
 
 ---
@@ -261,9 +279,9 @@ export const extractDocumentAuthMethods = ({ documentAuth, recipientAuth }) => {
 
 | 验证点 | 模板克隆 | 直链签署 | 嵌入预签名 |
 |--------|---------|---------|-----------|
-| 创建时访问鉴权 | - (登录态创建) | ✓ (ACCOUNT或无) | ✓ (Presign Token) |
-| 签署时访问鉴权 | ✓ (完整支持) | - (已在创建时完成) | ✓ (完整支持) |
-| 字段动作鉴权 | ✓ (签名字段) | ✓ (仅签名字段) | ✓ (仅签名字段) |
+| 创建时访问鉴权 | - (登录态创建) | ✓ (ACCOUNT或无) | ✓ (Presign Token验证) |
+| 签署时访问鉴权 | ✓ (完整支持5种) | - (已在创建时完成) | ✓ (完整支持5种) |
+| 字段动作鉴权 | ✓ (仅签名字段) | ✓ (仅签名字段) | ✓ (仅签名字段) |
 | 签署顺序控制 | ✓ | ✓ | ✓ |
 
 ---
@@ -307,7 +325,7 @@ model Envelope {
   id          String          @id @unique
   type        EnvelopeType    // DOCUMENT | TEMPLATE
   status      DocumentStatus  // DRAFT | PENDING | COMPLETED
-  source      DocumentSource? // TEMPLATE | TEMPLATE_DIRECT_LINK
+  source      DocumentSource? // DOCUMENT | TEMPLATE | TEMPLATE_DIRECT_LINK
   authOptions Json            // 全局鉴权配置
   
   recipients  Recipient[]     // 一对多
@@ -353,13 +371,16 @@ model Recipient {
 │ FromTemplate      │  │ FromDirectTemplate│  │ Document          │
 └─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘
           │                       │                       │
-          │ 创建Envelope          │ 创建Envelope          │ 验证Presign Token
-          │ 创建Recipients        │ 创建Recipients        │ ────────────────
-          │ 创建Fields            │ 创建Fields            │ createEnvelope
-          │ signingStatus=NOT_SIGNED │ 直链收件人=SIGNED   │
+          │ 独立创建Envelope      │ 独立创建Envelope      │ 调用公共createEnvelope
+          │ +团队默认收件人        │ 无默认收件人          │ +团队默认收件人
+          │ 创建Recipients        │ 创建Recipients        │
+          │ 创建Fields            │ 创建Fields            │
+          │ signingStatus=NOT_SIGNED│ 直链收件人=SIGNED    │
           │ inserted=false        │ 直链字段inserted=true │
+          │ source=TEMPLATE       │ source=TEMPLATE_DIRECT_LINK│ source=DOCUMENT
           │                       │ 创建Signature记录 ✓   │
           │                       │ 写入多类审计日志 ✓     │
+          │                       │ 内部触发sendDocument  │
           └───────────────────────┼───────────────────────┘
                                   │
                                   ▼
@@ -394,8 +415,9 @@ model Recipient {
 2. **仅签名字段验证动作鉴权**: 其他字段类型绕过动作鉴权
 3. **无法中途变更**: 直链签署是原子操作，创建即完成，无法撤销或修改
 4. **版本差异处理**: V2 版本处理只读字段和预填充字段的逻辑不同
+5. **无默认收件人**: 直链签署仅复制模板配置的收件人，不添加团队默认收件人
 
-### 9.2 代码复用率统计
+### 9.2 代码复用率统计（代码核对版）
 
 | 模块 | 模板克隆 | 直链签署 | 嵌入预签名 |
 |------|---------|---------|-----------|
@@ -406,10 +428,13 @@ model Recipient {
 | isRecipientAuthorized | 100% | ~80% (访问鉴权分支受限) | 100% |
 | validateFieldAuth | 100% | 100% | 100% |
 | signFieldWithToken | 100% | 0% (内部独立实现) | 100% |
-| PDF复制逻辑 | 100% | ~90% (使用 putPdfFileServerSide vs putNormalizedPdfFileServerSide) | N/A (引用已有) |
+| createEnvelope 公共函数 | 0% (独立实现) | 0% (独立实现) | 100% |
+| PDF复制函数 | putNormalizedPdfFileServerSide | putPdfFileServerSide | N/A (直接引用) |
+| 团队默认收件人 | ✅ 添加 | ❌ 不添加 | ✅ 添加 |
 
 ---
 
-**文档版本**: 2.0  
+**文档版本**: 2.1  
 **最后更新**: 2024  
-**关键修正**: 明确直链签署独立实现路径、补充鉴权能力边界、新增三条链路数据契约传递对照表
+**核对状态**: ✅ 所有字段已与源代码逐行核对  
+**关键修正**: source字段修正（嵌入预签名=DOCUMENT）、默认收件人差异、嵌入收件人authOptions为空、PDF复制函数差异、审计日志数量差异

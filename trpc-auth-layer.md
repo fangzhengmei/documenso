@@ -334,7 +334,7 @@ type ApiRequestMetadata = {
 | ✓ 存在 | ✗ 不存在 | ✓ 存在 | **回落到会话认证** | 'session' | x-team-id header (或 -1) |
 | ✓ 存在 | ✗ 不存在 | ✗ 不存在 | authenticated → **抛出 UNAUTHORIZED** <br> maybeAuth → **继续匿名** | null | undefined |
 | ✗ 不存在 | ✓ 存在 | ✓ 存在 | **会话认证分支** (OpenAPI 路由但无 API Key) | 'session' | x-team-id header (或 -1) |
-| ✗ 不存在 | ✓ 存在 | ✗ 不存在 | **抛出 UNAUTHORIZED** | - | - |
+| ✗ 不存在 | ✓ 存在 | ✗ 不存在 | authenticatedProcedure → **抛出 UNAUTHORIZED** <br> maybeAuthenticatedProcedure → **继续匿名流程** | null | undefined |
 
 **核心规则**（代码第 86 行）：`if (authorizationHeader && isApiV2)` → 只有两个条件**同时满足**才走 API Key 分支，否则回落到会话校验（authenticated）或匿名（maybeAuth）。
 

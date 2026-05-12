@@ -494,11 +494,11 @@ const recipientAuditLogs = auditLogs.filter(log =>
 | `transactionId` | `DOCUMENT_COMPLETED` 事件 | 整个签署流程的最终唯一标识 |
 | `requestMetadata` | 所有事件 | 捕获 IP、UserAgent，用于审计追踪 |
 | `fieldSecurity` | 字段插入事件 | 记录签署时的认证方式（2FA 等） |
-| `secondaryId` | 签名字段 | 字段级别的哈希标识，显示在证书上 |
+| `secondaryId` | 签名字段 | 字段外部唯一标识，显示在证书上 |
 
 ### 4.3 防篡改保障层级
 
-1. **数据库级**：审计日志为追加写入模式，不支持更新/删除
+1. **数据库级**：审计日志为追加写入模式，正常业务流程中不支持更新/删除；但在文档硬删除场景下会随文档级联删除
 2. **PDF 数字签名级**：PKCS#7/CAdES 签名确保 PDF 文件内容未被篡改
 3. **证书链级**：X.509 证书链验证签名者身份的合法性
 4. **时间戳级**：RFC 3161 TSA 证明签名发生的准确时间

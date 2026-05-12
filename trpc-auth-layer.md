@@ -320,7 +320,277 @@ type ApiRequestMetadata = {
 
 ---
 
-## 四、API V1 vs tRPC 认证对比
+## 四、请求执行链路时序分析
+
+### 4.1 完整请求执行时序（会话认证模式）
+
+以下是一次真实 Web 应用请求的完整执行链路（以 `findTeamMembers` 路由为例）：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: HTTP 请求入口 (Hono Server)                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│ 路径: POST /api/trpc/team.findTeamMembers                          │
+│ Headers:                                                            │
+│   - Cookie: documenso.session=xxx (会话凭证)                        │
+│   - x-team-id: 12345                                                │
+│   - Content-Type: application/json                                  │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Context 初始化 (createTrpcContext)                         │
+├─────────────────────────────────────────────────────────────────────┤
+│ 调用: getOptionalSession(c) 从 Cookie 解析会话                      │
+│                                                                     │
+│ 初始 Context 状态:                                                  │
+│   ├── logger: { ipAddress, userAgent, requestId: 'abc123' }        │
+│   ├── session: Session { id: 'sess_xxx', userId: 1001 }            │
+│   ├── user: { id: 1001, name: 'Alice', email: 'alice@documenso.com' }│
+│   ├── teamId: 12345 (从 x-team-id header 解析)                     │
+│   ├── req: Request 对象                                            │
+│   ├── res: Response 对象                                           │
+│   └── metadata: { source: 'app', auth: null }                      │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: 路由匹配与 Procedure 分派                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│ 路由定义:                                                           │
+│   export const findTeamMembersRoute = authenticatedProcedure       │
+│     .input(ZFindTeamMembersRequestSchema)                           │
+│     .output(ZFindTeamMembersResponseSchema)                         │
+│     .query(handler)                                                 │
+│                                                                     │
+│ 分派结果: 使用 authenticatedProcedure → 触发 authenticatedMiddleware│
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 4: authenticatedMiddleware 执行分支判断                        │
+├─────────────────────────────────────────────────────────────────────┤
+│ 判断条件:                                                           │
+│   - authorizationHeader? → undefined (无 API Key)                   │
+│   - isApiV2 = Boolean(meta.openapi.path) → false (非 OpenAPI 路由) │
+│   → 进入【会话认证分支】                                             │
+│                                                                     │
+│ 校验: if (!ctx.session) → 通过，会话存在                            │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Context 增强处理                                           │
+├─────────────────────────────────────────────────────────────────────┤
+│ 1. Logger 子实例创建 (带 nonBatchedRequestId)                      │
+│    const trpcSessionLogger = ctx.logger.child({                    │
+│      nonBatchedRequestId: alphaid()  // e.g. 'def456'              │
+│    })                                                               │
+│                                                                     │
+│ 2. Metadata 更新:                                                   │
+│    ctx.metadata.auth = 'session'                                    │
+│    ctx.metadata.auditUser = {                                       │
+│      id: 1001,                                                      │
+│      name: 'Alice',                                                 │
+│      email: 'alice@documenso.com'                                   │
+│    }                                                                │
+│                                                                     │
+│ 3. Team ID 规范化:                                                  │
+│    ctx.teamId = ctx.teamId || -1  // 12345                         │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 6: 业务 Handler 执行 (findTeamMembers)                        │
+├─────────────────────────────────────────────────────────────────────┤
+│ Handler 可访问的最终 Context 状态:                                  │
+│                                                                     │
+│  ctx = {                                                            │
+│    logger: LoggerChild({                                            │
+│      ipAddress: '192.168.1.1',                                      │
+│      userAgent: 'Chrome/120.0',                                     │
+│      requestId: 'abc123',        // Hono 层请求 ID                  │
+│      nonBatchedRequestId: 'def456'  // tRPC 子请求 ID               │
+│    })                                                               │
+│    session: Session { id: 'sess_xxx', userId: 1001, ... }          │
+│    user: { id: 1001, name: 'Alice', email: 'alice@documenso.com' } │
+│    teamId: 12345                                                    │
+│    req: Request                                                     │
+│    res: Response                                                    │
+│    metadata: {                                                      │
+│      source: 'app',                                                 │
+│      auth: 'session',                                               │
+│      auditUser: { id: 1001, name: 'Alice', email: '...' }          │
+│    }                                                                │
+│  }                                                                  │
+│                                                                     │
+│ 业务逻辑: 使用 ctx.user.id 和 ctx.teamId 进行数据库查询...         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 4.2 对照时序 A：匿名访问（maybeAuthenticatedProcedure）
+
+以公开文档查看路由为例，使用 `maybeAuthenticatedProcedure`：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: HTTP 请求入口                                               │
+├─────────────────────────────────────────────────────────────────────┤
+│ 路径: POST /api/trpc/document.getPublicDocument                     │
+│ Headers: 无 Cookie，无 Authorization                                 │
+│          x-team-id: 无                                              │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Context 初始化                                              │
+├─────────────────────────────────────────────────────────────────────┤
+│ getOptionalSession(c) → { session: null, user: null }              │
+│                                                                     │
+│ 初始 Context:                                                       │
+│   session: null                                                     │
+│   user: null                                                        │
+│   teamId: undefined                                                 │
+│   metadata: { source: 'app', auth: null }                           │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: Procedure 分派 → maybeAuthenticatedProcedure              │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 4: maybeAuthenticatedMiddleware 执行                          │
+├─────────────────────────────────────────────────────────────────────┤
+│ 判断条件:                                                           │
+│   - authorizationHeader? → undefined                                │
+│   - isApiV2? → false                                                │
+│   → 无认证信息，保留匿名状态                                        │
+│                                                                     │
+│ 不抛出异常！这是与 authenticatedMiddleware 的核心区别               │
+│                                                                     │
+│ Context 状态保持:                                                   │
+│   session: null                                                     │
+│   user: null                                                        │
+│   metadata.auth: null                                               │
+│   metadata.auditUser: undefined                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Handler 执行（匿名模式）                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│ Handler 接收 Context:                                               │
+│   ctx.user → null  ❗ 业务代码必须处理 user 为 null 的情况          │
+│   ctx.teamId → undefined                                            │
+│   ctx.metadata.auth → null                                          │
+│                                                                     │
+│ 业务逻辑: 仅返回公开文档信息，不返回任何用户私有数据                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键点**：`maybeAuthenticatedProcedure` 允许 `ctx.user` 为 `null`，业务 Handler 必须自行处理匿名访问逻辑。
+
+---
+
+### 4.3 对照时序 B：API Key 认证（OpenAPI 路由）
+
+以 API V2 文档列表查询为例：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 1: HTTP 请求入口                                               │
+├─────────────────────────────────────────────────────────────────────┤
+│ 路径: GET /api/v2/documents                                         │
+│ Headers:                                                            │
+│   - Authorization: Bearer api_abc123def456                         │
+│   - x-team-id: 67890                                                │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Context 初始化                                              │
+├─────────────────────────────────────────────────────────────────────┤
+│ getOptionalSession(c) → { session: null, user: null }              │
+│                                                                     │
+│ 初始 Context:                                                       │
+│   session: null                   ❗ 会话为空                       │
+│   user: null                      ❗ 用户为空                       │
+│   teamId: 67890 (从 header 解析，后续会被 API Token 覆盖)           │
+│   metadata: { source: 'apiV2', auth: null }                        │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 3: Procedure 分派 → authenticatedProcedure                   │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 4: authenticatedMiddleware 执行 → API Key 分支               │
+├─────────────────────────────────────────────────────────────────────┤
+│ 判断条件:                                                           │
+│   - authorizationHeader? → 'Bearer api_abc123def456' ✓             │
+│   - isApiV2 = Boolean(meta.openapi.path) → true ✓                  │
+│   → 进入【API Key 认证分支】                                         │
+│                                                                     │
+│ Token 解析:                                                         │
+│   const [token] = authorization.split('Bearer ').filter(Boolean)   │
+│   // token = 'api_abc123def456'                                    │
+│                                                                     │
+│ 数据库查询: getApiTokenByToken({ token })                           │
+│   → 查找有效的 API Token 记录                                       │
+│   → 关联 user 和 team                                              │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Context 增强（API Key 模式）                               │
+├─────────────────────────────────────────────────────────────────────┤
+│  ctx = {                                                            │
+│    ...                                                              │
+│    user: apiToken.user          ❗ 从 API Token 关联的用户          │
+│    teamId: apiToken.teamId      ❗ 覆盖 header 中的 teamId         │
+│    session: null                 ❗ 始终为 null                     │
+│    metadata: {                                                      │
+│      source: 'apiV2',                                               │
+│      auth: 'api',               ✅ 标记为 API 认证                  │
+│      auditUser: {                                                   │
+│        id: apiToken.team ? null : apiToken.user.id,                 │
+│        email: apiToken.team ? null : apiToken.user.email,           │
+│        name: apiToken.team?.name ?? apiToken.user.name              │
+│      }                                                              │
+│    }                                                                │
+│  }                                                                  │
+│                                                                     │
+│ 注意: 如果是团队级 API Token，auditUser.id/email 为 null            │
+└─────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────────┐
+│ STEP 6: Handler 执行（API 模式）                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│ Handler 接收 Context:                                               │
+│   ctx.user → { id: 2002, name: 'API Bot', email: 'api@documenso.com' }│
+│   ctx.teamId → 67890 (来自 API Token)                              │
+│   ctx.session → null                                               │
+│   ctx.metadata.auth → 'api'                                        │
+│                                                                     │
+│ 业务逻辑: 与会话认证一致，但通过 ctx.metadata.auth 区分审计来源    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**关键点**：
+1. 即使有会话 Cookie，只要提供 Authorization header + OpenAPI meta，优先走 API Key 认证
+2. API Token 中的 teamId 会覆盖 x-team-id header，防止越权访问
+3. 团队级 API Token 的 auditUser.id/email 为 null，仅保留团队名用于审计
+
+---
+
+### 4.4 三种入口最终状态对比表
+
+| 字段 | 公开访问 (procedure) | 匿名访问 (maybeAuth) | 会话认证 (authed) | API Key 认证 (authed) |
+|------|---------------------|---------------------|-------------------|----------------------|
+| ctx.session | null / Session | null | Session | null |
+| ctx.user | null / User | null | User | User |
+| ctx.teamId | undefined | undefined | number (from header) | number (from token) |
+| ctx.metadata.source | 'app' / 'apiV2' | 'app' | 'app' | 'apiV2' |
+| ctx.metadata.auth | null | null | 'session' | 'api' |
+| ctx.metadata.auditUser | undefined | undefined | { id, name, email } | { id?, name, email? } |
+| 认证失败行为 | - | 继续执行 | 抛出 UNAUTHORIZED | 抛出 UNAUTHORIZED |
+
+---
+
+## 五、API V1 vs tRPC 认证对比
 
 ### 4.1 API V1 独立中间件
 

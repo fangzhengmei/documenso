@@ -6,14 +6,35 @@
 
 | 概念角色 | 系统中对应类型 | 定义文件 | 说明 |
 |---------|-------------|---------|------|
-| 所有者 | `Organisation.ownerUserId` | `packages/prisma/schema.prisma:719` | 组织拥有者，独立于团队角色体系 |
+| 所有者 | `Organisation.ownerUserId` | `packages/prisma/schema.prisma:719` | 组织拥有者字段 |
 | 管理员 | `TeamMemberRole.ADMIN` | `packages/prisma/schema.prisma:822` | 团队管理员角色 |
 | 经理 | `TeamMemberRole.MANAGER` | `packages/prisma/schema.prisma:823` | 团队经理角色 |
 | 成员 | `TeamMemberRole.MEMBER` | `packages/prisma/schema.prisma:824` | 团队普通成员角色 |
-| 文档参与者 | `RecipientRole.SIGNER/APPROVER` | `packages/prisma/schema.prisma:574` | 文档级接收者角色，非团队角色 |
-| 查看人 | `RecipientRole.VIEWER` | `packages/prisma/schema.prisma:576` | 文档级只读角色，非团队角色 |
+| 文档接收者 | `RecipientRole.SIGNER/APPROVER/VIEWER/ASSISTANT/CC` | `packages/prisma/schema.prisma:574` | 文档级接收者角色，非团队角色 |
 
-### 1.2 角色权限映射配置
+### 1.2 RecipientRole 全部角色说明
+
+**文件位置**: `packages/prisma/schema.prisma:574-579`
+
+```prisma
+enum RecipientRole {
+  CC
+  SIGNER
+  VIEWER
+  APPROVER
+  ASSISTANT
+}
+```
+
+| RecipientRole | 说明 |
+|--------------|------|
+| SIGNER | 文档签署者 |
+| APPROVER | 文档审批者 |
+| VIEWER | 文档查看者 |
+| ASSISTANT | 文档协助者 |
+| CC | 文档抄送者 |
+
+### 1.3 角色权限映射配置
 
 **文件位置**: `packages/lib/constants/teams.ts:31-34`
 
@@ -29,7 +50,7 @@ export const TEAM_MEMBER_ROLE_PERMISSIONS_MAP = {
 | DELETE_TEAM | ADMIN |
 | MANAGE_TEAM | ADMIN, MANAGER |
 
-### 1.3 角色层级关系
+### 1.4 角色层级关系
 
 **文件位置**: `packages/lib/constants/teams.ts:48-52`
 
@@ -47,7 +68,7 @@ export const TEAM_MEMBER_ROLE_HIERARCHY = {
 | MANAGER | MANAGER, MEMBER |
 | MEMBER | MEMBER |
 
-### 1.4 文档可见性映射
+### 1.5 文档可见性映射
 
 **文件位置**: `packages/lib/constants/teams.ts:36-40`
 
@@ -352,13 +373,15 @@ useEffect(() => {
 
 | 角色 | 可执行操作 | 可见文档范围 | UI入口 |
 |-----|----------|------------|-------|
-| ADMIN | MANAGE_TEAM, DELETE_TEAM | EVERYONE, MANAGER_AND_ABOVE, ADMIN | 团队设置入口可见，成员管理完整功能，删除团队按钮可用 |
-| MANAGER | MANAGE_TEAM | EVERYONE, MANAGER_AND_ABOVE | 团队设置入口可见，可管理成员但不可删除团队 |
-| MEMBER | - | EVERYONE | 团队设置入口不可见，仅可见团队公开文档 |
-| 所有者 | 组织级最高权限 | 全部可见 | 组织管理控制台可见 |
-| SIGNER (文档级) | 签署文档 | 仅本人作为接收者的文档 | 文档签署页面 |
-| VIEWER (文档级) | 查看文档 | 仅本人作为接收者的文档 | 文档查看页面 |
-| APPROVER (文档级) | 审批文档 | 仅本人作为接收者的文档 | 文档审批页面 |
+| ADMIN | MANAGE_TEAM, DELETE_TEAM | EVERYONE, MANAGER_AND_ABOVE, ADMIN | 团队设置入口可见，成员管理完整功能 |
+| MANAGER | MANAGE_TEAM | EVERYONE, MANAGER_AND_ABOVE | 团队设置入口可见，可管理成员 |
+| MEMBER | - | EVERYONE | 团队设置入口不可见 |
+| 所有者 | `organisation.ownerUserId 字段 | 无 | 组织拥有者ID字段 |
+| SIGNER (文档级) | - | 无 | 文档签署页面 |
+| VIEWER (文档级) | - | 无 | 文档查看页面 |
+| APPROVER (文档级) | - | 无 | 文档审批页面 |
+| ASSISTANT (文档级) | - | 无 | 文档协助页面 |
+| CC (文档级) | - | 无 | 文档抄送页面 |
 
 ---
 
@@ -385,5 +408,5 @@ UI组件二次检查 (同一文件)
   ↓
 TeamsSettingsLayout → useCurrentTeam() → canExecuteTeamAction 二次检查
   ↓
-页面渲染完成（仅对ADMIN/MANAGER可见）
+页面渲染完成
 ```

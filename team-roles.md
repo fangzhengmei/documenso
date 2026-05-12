@@ -1,37 +1,45 @@
 # 团队角色权限系统设计报告
 
-## 一、角色定义
+## 一、角色定义与真实对应关系
 
-### 1.1 角色类型定义
+### 1.1 系统中实际存在的角色类型
 
-系统中定义了三种团队角色，位于 `packages/lib/constants/teams.ts`：
+**组织与团队角色层级：
+
+| 概念角色 | 系统真实对应 | 定义位置 | 说明 |
+|---------|-------------|---------|------|
+| 所有者 | `Organisation.ownerUserId` | `packages/prisma/schema.prisma:719 | 组织拥有者，独立于团队角色体系，具有组织最高权限 |
+| 管理员 | `TeamMemberRole.ADMIN` | `packages/prisma/schema.prisma:822` | 团队管理员，拥有团队全部权限 |
+| 经理 | `TeamMemberRole.MANAGER` | `packages/prisma/schema.prisma:823` | 团队经理，可管理团队设置和成员 |
+| 成员 | `TeamMemberRole.MEMBER` | `packages/prisma/schema.prisma:824` | 团队普通成员，仅可见公开文档 |
+| 文档参与者 | `RecipientRole.SIGNER/APPROVER` | `packages/prisma/schema.prisma:574` | 文档级角色，非团队角色 |
+| 查看人 | `RecipientRole.VIEWER` | `packages/prisma/schema.prisma:576` | 文档级只读角色，非团队角色 |
+
+> **重要说明**：
+- "文档参与者"和"查看人"是文档级接收者角色（RecipientRole），不属于团队角色体系
+- 团队成员（TeamMemberRole）控制团队级权限，接收者角色（RecipientRole）控制文档级操作权限
+
+### 1.2 角色权限映射配置
+
+**文件位置**：`packages/lib/constants/teams.ts:31-34`
 
 ```typescript
-export const TEAM_MEMBER_ROLE_MAP: Record<keyof typeof TeamMemberRole, MessageDescriptor> = {
-  ADMIN: msg`Admin`,         // 管理员
-  MANAGER: msg`Manager`,     // 经理
-  MEMBER: msg`Member`,         // 成员
-};
-```
-
-### 1.2 角色权限映射
-
-每种角色与操作权限映射定义了每个角色可以执行哪些操作：
-
-```typescript
-// packages/lib/constants/teams.ts
 export const TEAM_MEMBER_ROLE_PERMISSIONS_MAP = {
   DELETE_TEAM: [TeamMemberRole.ADMIN],
   MANAGE_TEAM: [TeamMemberRole.ADMIN, TeamMemberRole.MANAGER],
 } satisfies Record<string, TeamMemberRole[]>;
 ```
 
+| 操作权限 | 允许角色 |
+|---------|---------|
+| DELETE_TEAM | 仅 ADMIN |
+| MANAGE_TEAM | ADMIN, MANAGER |
+
 ### 1.3 角色层级关系
 
-角色层级定义了哪个角色可以管理其他角色：
+**文件位置**：`packages/lib/constants/teams.ts:48-52`
 
 ```typescript
-// packages/lib/constants/teams.ts
 export const TEAM_MEMBER_ROLE_HIERARCHY = {
   [TeamMemberRole.ADMIN]: [TeamMemberRole.ADMIN, TeamMemberRole.MANAGER, TeamMemberRole.MEMBER],
   [TeamMemberRole.MANAGER]: [TeamMemberRole.MANAGER, TeamMemberRole.MEMBER],
@@ -39,7 +47,15 @@ export const TEAM_MEMBER_ROLE_HIERARCHY = {
 } satisfies Record<TeamMemberRole, TeamMemberRole[]>;
 ```
 
-### 1.4 文档可见性权限
+| 当前角色 | 可管理的角色 |
+|---------|-------------|
+| ADMIN | ADMIN, MANAGER, MEMBER |
+| MANAGER | MANAGER, MEMBER |
+| MEMBER | MEMBER |
+
+### 1.4 文档可见性映射
+
+**文件位置**：`packages/lib/constants/teams.ts:36-40`
 
 ```typescript
 export const TEAM_DOCUMENT_VISIBILITY_MAP = {
@@ -49,13 +65,19 @@ export const TEAM_DOCUMENT_VISIBILITY_MAP = {
 } satisfies Record<TeamMemberRole, DocumentVisibility[]>;
 ```
 
+| 团队角色 | 可见文档范围 |
+|---------|-------------|
+| ADMIN | EVERYONE, MANAGER_AND_ABOVE, ADMIN |
+| MANAGER | EVERYONE, MANAGER_AND_ABOVE |
+| MEMBER | EVERYONE |
+
+---
+
 ## 二、权限断言工具函数
 
-### 2.1 核心工具函数
+### 2.1 操作权限检查
 
-位于 `packages/lib/utils/teams.ts`
-
-#### `canExecuteTeamAction` - 操作权限检查
+**文件位置**：`packages/lib/utils/teams.ts:43-48`
 
 ```typescript
 export const canExecuteTeamAction = (
@@ -66,9 +88,19 @@ export const canExecuteTeamAction = (
 };
 ```
 
-**使用场景**：检查用户是否可以执行特定操作，如 `MANAGE_TEAM`、`DELETE_TEAM`
+**作用**：检查指定角色是否有权执行特定操作
 
-#### `isTeamRoleWithinUserHierarchy` - 层级权限检查
+**使用示例**：
+```typescript
+// 检查是否可以管理团队设置
+if (canExecuteTeamAction('MANAGE_TEAM', team.currentTeamRole)) {
+  // 显示设置入口
+}
+```
+
+### 2.2 角色层级权限检查
+
+**文件位置**：`packages/lib/utils/teams.ts:69-74`
 
 ```typescript
 export const isTeamRoleWithinUserHierarchy = (
@@ -79,9 +111,11 @@ export const isTeamRoleWithinUserHierarchy = (
 };
 ```
 
-**使用场景**：检查当前用户是否可以修改另一个角色的用户（例如，Manager不能修改Admin）
+**作用**：检查当前用户角色是否有权管理目标角色（用于成员管理）
 
-#### `canAccessTeamDocument` - 文档可见性检查
+### 2.3 文档可见性检查
+
+**文件位置**：`packages/lib/utils/teams.ts:57-59`
 
 ```typescript
 export const canAccessTeamDocument = (role: TeamMemberRole, visibility: DocumentVisibility) => {
@@ -89,7 +123,9 @@ export const canAccessTeamDocument = (role: TeamMemberRole, visibility: Document
 };
 ```
 
-#### `getHighestTeamRoleInGroup` - 获取用户最高角色
+### 2.4 获取用户最高角色
+
+**文件位置**：`packages/lib/utils/teams.ts:76-89`
 
 ```typescript
 export const getHighestTeamRoleInGroup = (groups: TeamGroup[]): TeamMemberRole => {
@@ -108,72 +144,86 @@ export const getHighestTeamRoleInGroup = (groups: TeamGroup[]): TeamMemberRole =
 };
 ```
 
-### 2.2 数据库查询构建器
+**实现原理**：通过角色层级数组的长度来判断角色优先级，长度越大优先级越高。
 
-#### `buildTeamWhereQuery` - 构建带权限的查询条件
+### 2.5 数据库查询权限构建
+
+**文件位置**：`packages/lib/utils/teams.ts:125-169`
 
 ```typescript
-export type BuildTeamWhereQueryOptions = {
-  teamId: number | undefined;
-  userId: number;
-  roles?: TeamMemberRole[];
-};
-
 export const buildTeamWhereQuery = ({
   teamId,
   userId,
   roles,
 }: BuildTeamWhereQueryOptions): Prisma.TeamWhereUniqueInput => {
-  // 构建关联查询条件，确保用户只能访问有权限的团队
-};
-```
-
-## 三、服务端权限获取与中间件
-
-### 3.1 获取团队成员角色
-
-位于 `packages/lib/server-only/team/get-member-roles.ts`
-
-```typescript
-export const getMemberRoles = async ({ teamId, reference }: GetMemberRolesOptions) => {
-  const team = await prisma.team.findFirst({
-    where: {
+  if (!roles) {
+    return {
       id: teamId,
-    },
-    include: {
       teamGroups: {
-        where: {
+        some: {
           organisationGroup: {
             organisationGroupMembers: {
-              some: {
-                organisationMember:
-                  reference.type === 'User'
-                    ? { userId: reference.id }
-                    : { id: reference.id },
-              },
+              some: { organisationMember: { userId } },
             },
           },
         },
       },
-    },
-  });
+    };
+  }
 
   return {
-    teamRole: getHighestTeamRoleInGroup(team.teamGroups),
+    id: teamId,
+    teamGroups: {
+      some: {
+        organisationGroup: {
+          organisationGroupMembers: {
+            some: { organisationMember: { userId } },
+          },
+        },
+        teamRole: { in: roles },
+      },
+    },
   };
 };
 ```
 
-### 3.2 获取团队信息（附带当前用户角色
+**作用**：构建Prisma查询条件，确保用户只能访问有权限的团队数据。
 
-位于 `packages/lib/server-only/team/get-team.ts`
+---
+
+## 三、服务端权限获取链路
+
+### 3.1 权限检查调用链
+
+**获取团队信息时的完整权限检查链路：
+
+```
+1. Route Loader (apps/remix/app/routes/_authenticated+/t.$teamUrl+/settings._layout.tsx:21-31
+   ↓
+2. getTeamByUrl (packages/lib/server-only/team/get-team.ts:28-33
+   ↓
+3. getTeam (packages/lib/server-only/team/get-team.ts:38-84
+   ↓
+4. buildTeamWhereQuery (packages/lib/utils/teams.ts:125-169) → 数据库级权限过滤
+   ↓
+5. prisma.team.findFirst → 只返回用户有权访问的团队
+   ↓
+6. getHighestTeamRoleInGroup (packages/lib/utils/teams.ts:76-89) → 计算用户最高角色
+   ↓
+7. 返回 team.currentTeamRole
+```
+
+### 3.2 获取团队信息（附带角色
+
+**文件位置**：`packages/lib/server-only/team/get-team.ts:38-84`
 
 ```typescript
 export const getTeam = async ({ teamReference, userId }) => {
   const team = await prisma.team.findFirst({
     where: {
       ...buildTeamWhereQuery({ teamId: undefined, userId }),
-      // ...
+      id: typeof teamReference === 'number' ? teamReference : undefined,
+      url: typeof teamReference === 'string' ? teamReference : undefined,
     },
     include: {
       teamGroups: {
@@ -185,411 +235,270 @@ export const getTeam = async ({ teamReference, userId }) => {
           },
         },
       },
-      // ...
     },
   });
 
   return {
     ...team,
     currentTeamRole: getHighestTeamRoleInGroup(team.teamGroups),
-    // ...
   };
 };
 ```
 
-### 3.3 TRPC路由中的权限检查
+**关键点**：
+- 通过关联查询`teamGroups`时加入用户过滤条件，确保只查询到的是该用户所属的用户组
+- 通过`getHighestTeamRoleInGroup`计算用户在该团队的最高角色
 
-以 `update-team-member.ts` 为例：
+### 3.3 文档查询中的权限过滤
+
+**文件位置**：`packages/lib/server-only/document/find-documents.ts:299-336`
 
 ```typescript
-export const updateTeamMemberRoute = authenticatedProcedure
-  .input(ZUpdateTeamMemberRequestSchema)
-  .mutation(async ({ ctx, input }) => {
-    const { teamId, memberId, data } = input;
-    const userId = ctx.user.id;
+const applyTeamFilters = (qb, teamData) => {
+  const allowedVisibilities = match(teamData.currentTeamRole)
+    .with(TeamMemberRole.ADMIN, () => [
+      DocumentVisibility.EVERYONE,
+      DocumentVisibility.MANAGER_AND_ABOVE,
+      DocumentVisibility.ADMIN,
+    ])
+    .with(TeamMemberRole.MANAGER, () => [DocumentVisibility.EVERYONE, DocumentVisibility.MANAGER_AND_ABOVE])
+    .otherwise(() => [DocumentVisibility.EVERYONE]);
 
-    // 1. 构建带权限的查询，只允许有权限的用户操作
-    const team = await prisma.team.findFirst({
-      where: {
-        AND: [
-          buildTeamWhereQuery({
-            teamId,
-            userId,
-            roles: TEAM_MEMBER_ROLE_PERMISSIONS_MAP['MANAGE_TEAM'],
-          }),
-          // ...
-        ],
-      },
-    });
+  const visibilityFilter = (eb) =>
+    eb.or([
+      eb('Envelope.visibility', 'in', allowedVisibilities.map((v) => sql.lit(v))),
+      eb('Envelope.userId', '=', user.id),
+      recipientExists(eb, user.email),
+    ]);
 
-    // 2. 获取当前用户和目标用户的角色
-    const { teamRole: currentUserTeamRole } = await getMemberRoles({
-      teamId,
-      reference: { type: 'User', id: userId },
-    });
-
-    const { teamRole: currentMemberToUpdateTeamRole } = await getMemberRoles({
-      teamId,
-      reference: { type: 'Member', id: memberId },
-    });
-
-    // 3. 检查角色层级权限
-    if (!isTeamRoleWithinUserHierarchy(currentUserTeamRole, currentMemberToUpdateTeamRole)) {
-      throw new AppError(AppErrorCode.UNAUTHORIZED, {
-        message: 'Cannot update a member with a higher role',
-      });
-    }
-
-    if (!isTeamRoleWithinUserHierarchy(currentUserTeamRole, data.role)) {
-      throw new AppError(AppErrorCode.UNAUTHORIZED, {
-        message: 'Cannot update a member to a role higher than your own',
-      });
-    }
-
-    // 执行更新操作...
-  });
+  // ... 其他过滤条件
+};
 ```
 
-## 四、UI层权限收敛
+**权限逻辑**：
+1. 根据团队角色确定可见的文档范围
+2. OR条件：满足文档可见性匹配 OR 用户是文档创建者 OR 用户是文档接收者
 
-### 4.1 TeamProvider - 团队上下文提供
+---
 
-位于 `apps/remix/app/providers/team.tsx`
+## 四、UI层权限收敛点
+
+### 4.1 TeamSession类型定义
+
+**文件位置**：`packages/trpc/server/organisation-router/get-organisation-session.types.ts:31`
 
 ```typescript
-type TeamProviderValue = TeamSession;
+export type TeamSession = {
+  id: number;
+  name: string;
+  url: string;
+  currentTeamRole: TeamMemberRole;
+  // ...其他字段
+};
+```
 
-interface TeamProviderProps {
-  children: React.ReactNode;
-  team: TeamProviderValue | null;
-}
+### 4.2 TeamProvider上下文注入
 
-const TeamContext = createContext<TeamProviderValue | null>(null);
+**文件位置**：`apps/remix/app/providers/team.tsx`
+
+```typescript
+const TeamContext = createContext<TeamSession | null>(null);
 
 export const useCurrentTeam = () => {
   const context = useContext(TeamContext);
-
-  if (!context) {
-    throw new Error('useCurrentTeam must be used within a TeamProvider');
-  }
-
+  if (!context) throw new Error('useCurrentTeam must be used within a TeamProvider');
   return context;
 };
 
-export const TeamProvider = ({ children, team }: TeamProviderProps) => {
+export const TeamProvider = ({ children, team }) => {
   return <TeamContext.Provider value={team}>{children}</TeamContext.Provider>;
 };
 ```
 
-### 4.2 路由级别的权限控制
+**收敛作用**：将`team.currentTeamRole`注入整个团队上下文，所有子组件可直接获取。
 
-位于 `apps/remix/app/routes/_authenticated+/t.$teamUrl+/settings._layout.tsx`
+### 4.3 路由级别的权限重定向
+
+**文件位置**：`apps/remix/app/routes/_authenticated+/t.$teamUrl+/settings._layout.tsx:21-31`
 
 ```typescript
-// Server Loader 中的权限检查
-export async function loader({ request, params }: Route.LoaderArgs) {
+export async function loader({ request, params }) {
   const session = await getSession(request);
+  const team = await getTeamByUrl({ userId: session.user.id, teamUrl: params.teamUrl });
 
-  const team = await getTeamByUrl({
-    userId: session.user.id,
-    teamUrl: params.teamUrl,
-  });
-
-  // 权限检查：无权限则重定向
+  // 权限检查：无权限则重定向到团队首页
   if (!team || !canExecuteTeamAction('MANAGE_TEAM', team.currentTeamRole)) {
     throw redirect(`/t/${params.teamUrl}`);
   }
 }
+```
 
-// Client 组件中的权限检查
-export default function TeamsSettingsLayout() {
-  const team = useCurrentTeam();
+**收敛作用**：在服务端渲染前进行权限检查，阻止无权限用户访问设置页面。
 
-  // 双重检查：客户端再次验证权限
-  if (!canExecuteTeamAction('MANAGE_TEAM', team.currentTeamRole)) {
-    return (
-      <GenericErrorLayout
-        errorCode={401}
-        errorCodeMap={{
-          401: {
-            heading: msg`Unauthorized`,
-            subHeading: msg`401 Unauthorized`,
-            message: msg`You are not authorized to access this page.`,
-          },
-        }}
-        // ...
-      />
-    );
+### 4.4 组件级别的按钮禁用
+
+**文件位置**：`apps/remix/app/components/tables/team-members-table.tsx:137-178`
+
+```typescript
+<TeamMemberUpdateDialog
+  currentUserTeamRole={team.currentTeamRole}
+  trigger={
+    <DropdownMenuItem
+      disabled={
+        organisation.ownerUserId === row.original.userId ||
+        !isTeamRoleWithinUserHierarchy(team.currentTeamRole, row.original.teamRole)
+      }
+    >
+      <EditIcon className="mr-2 h-4 w-4" />
+      <Trans>Update role</Trans>
+    </DropdownMenuItem>
   }
-
-  // 渲染设置页面...
-}
+/>
 ```
 
-### 4.3 组件级别的权限控制 - 团队成员表格
+**收敛逻辑**：
+1. 组织所有者不能被修改
+2. 只能修改层级低于等于当前用户角色的成员
 
-位于 `apps/remix/app/components/tables/team-members-table.tsx`
+### 4.5 对话框级别的角色过滤
+
+**文件位置**：`apps/remix/app/components/dialogs/team-member-update-dialog.tsx:94-110, 152-157`
 
 ```typescript
-export const TeamMembersTable = () => {
-  const organisation = useCurrentOrganisation();
-  const team = useCurrentTeam();
+useEffect(() => {
+  if (!open) return;
+  form.reset();
 
-  const columns = useMemo(() => {
-    return [
-      // ... 其他列
-      {
-        header: _(msg`Actions`),
-        cell: ({ row }) => (
-          <DropdownMenu>
-            <DropdownMenuTrigger>
-              <MoreHorizontal className="h-5 w-5 text-muted-foreground" />
-            </DropdownMenuTrigger>
+  // 打开对话框时再次检查权限
+  if (!isTeamRoleWithinUserHierarchy(currentUserTeamRole, memberTeamRole)) {
+    setOpen(false);
+    toast({ title: 'You cannot modify a team member who has a higher role than you.' });
+  }
+}, [open, currentUserTeamRole, memberTeamRole]);
 
-            <DropdownMenuContent>
-              {/* 更新角色按钮 - 根据层级权限禁用 */}
-              <TeamMemberUpdateDialog
-                currentUserTeamRole={team.currentTeamRole}
-                trigger={
-                  <DropdownMenuItem
-                    disabled={
-                      organisation.ownerUserId === row.original.userId ||
-                      !isTeamRoleWithinUserHierarchy(team.currentTeamRole, row.original.teamRole)
-                    }
-                  >
-                    <EditIcon className="mr-2 h-4 w-4" />
-                    <Trans>Update role</Trans>
-                  </DropdownMenuItem>
-                }
-              />
+// 下拉选择只显示层级内允许的角色
+<SelectContent>
+  {TEAM_MEMBER_ROLE_HIERARCHY[currentUserTeamRole].map((role) => (
+    <SelectItem key={role} value={role}>
+      {_(EXTENDED_TEAM_MEMBER_ROLE_MAP[role]) ?? role}
+    </SelectItem>
+  ))}
+</SelectContent>
+```
 
-              {/* 删除成员按钮 - 根据层级权限禁用 */}
-              <TeamMemberDeleteDialog
-                trigger={
-                  <DropdownMenuItem
-                    disabled={
-                      organisation.ownerUserId === row.original.userId ||
-                      !isTeamRoleWithinUserHierarchy(team.currentTeamRole, row.original.teamRole)
-                    }
-                  >
-                    <Trash2Icon className="mr-2 h-4 w-4" />
-                    <Trans>Remove</Trans>
-                  </DropdownMenuItem>
-                }
-              />
-            </DropdownMenuContent>
-          </DropdownMenu>
-        ),
-      },
-    ];
-  }, [groups]);
+**收敛作用**：
+1. 对话框打开时进行二次权限验证
+2. 下拉选项根据当前用户角色层级进行过滤
 
-  // ...
+---
+
+## 五、角色、操作、可见性、UI入口对照表
+
+| 角色 | 可执行操作 | 可见文档范围 | UI入口 |
+|-----|----------|------------|-------|
+| **ADMIN** | MANAGE_TEAM, DELETE_TEAM | EVERYONE, MANAGER_AND_ABOVE, ADMIN | 团队设置全部入口可见，成员管理全部功能完整，删除团队按钮可见 |
+| **MANAGER** | MANAGE_TEAM | EVERYONE, MANAGER_AND_ABOVE | 团队设置入口可见，可管理成员但不能删除团队 |
+| **MEMBER** | - | EVERYONE | 团队设置入口不可见，仅可见团队公开文档 |
+| **所有者** | (组织级最高权限) | 全部可见 | 组织管理控制台可见 |
+| **SIGNER** (文档级) | 签署文档 | 仅本人作为接收者的文档 | 文档签署页面 |
+| **VIEWER** (文档级) | 查看文档 | 仅本人作为接收者的文档 | 文档查看页面 |
+| **APPROVER** (文档级) | 审批文档 | 仅本人作为接收者的文档 | 文档审批页面 |
+
+---
+
+## 六、从配置到UI的最短调用链
+
+### 6.1 团队设置页面权限检查最短链路
+
+```
+配置定义
+  ↓
+[packages/lib/constants/teams.ts]
+  TEAM_MEMBER_ROLE_PERMISSIONS_MAP.MANAGE_TEAM
+  ↓
+工具函数
+  ↓
+[packages/lib/utils/teams.ts]
+  canExecuteTeamAction('MANAGE_TEAM', role)
+  ↓
+服务端获取
+  ↓
+[packages/lib/server-only/team/get-team.ts]
+  getTeamByUrl() → 返回 team.currentTeamRole
+  ↓
+路由Loader
+  ↓
+[apps/remix/app/routes/_authenticated+/t.$teamUrl+/settings._layout.tsx]
+  loader() → canExecuteTeamAction 检查，无权限则 redirect
+  ↓
+UI组件
+  ↓
+[apps/remix/app/routes/_authenticated+/t.$teamUrl+/settings._layout.tsx]
+  TeamsSettingsLayout → useCurrentTeam() → canExecuteTeamAction 二次检查
+  ↓
+子组件渲染
+  ↓
+设置页面完整渲染（仅对ADMIN/MANAGER可见）
+```
+
+### 6.2 成员更新权限检查最短链路
+
+```
+配置定义
+  ↓
+[packages/lib/constants/teams.ts]
+  TEAM_MEMBER_ROLE_HIERARCHY
+  ↓
+工具函数
+  ↓
+[packages/lib/utils/teams.ts]
+  isTeamRoleWithinUserHierarchy(currentRole, targetRole)
+  ↓
+表格行渲染
+  ↓
+[apps/remix/app/components/tables/team-members-table.tsx]
+  DropdownMenuItem disabled=!isTeamRoleWithinUserHierarchy(...)
+  ↓
+对话框打开
+  ↓
+[apps/remix/app/components/dialogs/team-member-update-dialog.tsx]
+  useEffect → isTeamRoleWithinUserHierarchy 二次检查
+  ↓
+角色选择下拉
+  ↓
+TEAM_MEMBER_ROLE_HIERARCHY[currentUserTeamRole].map()
+  ↓
+TRPC mutation
+  ↓
+[packages/trpc/server/team-router/update-team-member.ts]
+  buildTeamWhereQuery 带 MANAGE_TEAM 权限角色
+  isTeamRoleWithinUserHierarchy 服务端最终验证
+```
+
+---
+
+## 七、中间件的真实实现
+
+**文件位置**：`apps/remix/server/middleware.ts`
+
+**重要说明**：当前`appMiddleware`仅处理以下逻辑，**不负责团队权限检查：
+
+```typescript
+export const appMiddleware = async (c: Context, next: Next) => {
+  const { req } = c;
+  const { path } = req;
+
+  // 1. 处理重定向
+  const redirectPath = await handleRedirects(c);
+  if (redirectPath) return c.redirect(redirectPath);
+
+  await next();
+
+  // 2. 设置团队URL cookie
+  if (pathname.startsWith('/t/')) {
+    setCookie(c, 'preferred-team-url', pathname.split('/')[2], { sameSite: 'lax' });
+  }
 };
 ```
 
-### 4.4 对话框级别的权限控制
-
-位于 `apps/remix/app/components/dialogs/team-member-update-dialog.tsx`
-
-```typescript
-export const TeamMemberUpdateDialog = ({
-  currentUserTeamRole,
-  memberTeamRole,
-  // ...
-}: TeamMemberUpdateDialogProps) => {
-  const [open, setOpen] = useState(false);
-
-  // 打开时再次检查权限
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    if (!isTeamRoleWithinUserHierarchy(currentUserTeamRole, memberTeamRole)) {
-      setOpen(false);
-      toast({
-        title: _(msg`You cannot modify a team member who has a higher role than you.`),
-        variant: 'destructive',
-      });
-    }
-  }, [open, currentUserTeamRole, memberTeamRole]);
-
-  // 下拉选择只显示层级内允许的角色
-  return (
-    <Dialog>
-      <Form {...form}>
-        <form onSubmit={form.handleSubmit(onFormSubmit)}>
-          <FormField
-            control={form.control}
-            name="role"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel required>
-                  <Trans>Role</Trans>
-                </FormLabel>
-                <FormControl>
-                  <Select {...field} onValueChange={field.onChange}>
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {TEAM_MEMBER_ROLE_HIERARCHY[currentUserTeamRole].map((role) => (
-                      <SelectItem key={role} value={role}>
-                        {_(EXTENDED_TEAM_MEMBER_ROLE_MAP[role]) ?? role}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </FormControl>
-            </FormItem>
-          )}
-        />
-        {/* ... */}
-      </form>
-    </Dialog>
-  );
-};
-```
-
-## 五、权限系统架构图
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         配置层 (Configuration)                        │
-├─────────────────────────────────────────────────────────────────┤
-│  packages/lib/constants/teams.ts                              │
-│  - TEAM_MEMBER_ROLE_PERMISSIONS_MAP                          │
-│  - TEAM_MEMBER_ROLE_HIERARCHY                                  │
-│  - TEAM_DOCUMENT_VISIBILITY_MAP                               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       工具函数层 (Utils)                       │
-├─────────────────────────────────────────────────────────────────┤
-│  packages/lib/utils/teams.ts                                 │
-│  - canExecuteTeamAction(action, role)                         │
-│  - isTeamRoleWithinUserHierarchy(currentRole, targetRole)      │
-│  - canAccessTeamDocument(role, visibility)                    │
-│  - getHighestTeamRoleInGroup(groups)                           │
-│  - buildTeamWhereQuery(options)                               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-┌─────────────────────────────┐   ┌─────────────────────────────┐
-│     服务端获取层         │   │     中间件/路由层         │
-│   (Server Fetch)        │   │   (Middleware/Route)      │
-├─────────────────────────────┤   ├─────────────────────────────┤
-│ packages/lib/server-only/ │   │ apps/remix/server/       │
-│ team/get-member-roles.ts  │   │ middleware.ts            │
-│ team/get-team.ts         │   │ apps/remix/routes/      │
-│ - 从数据库获取用户角色    │   │ - Loader中调用权限检查    │
-│ - 关联查询团队组           │   │ - 无权限重定向           │
-└─────────────────────────────┘   └─────────────────────────────┘
-              │                               │
-              └───────────────┬───────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     TRPC API 层                                │
-├─────────────────────────────────────────────────────────────────┤
-│  packages/trpc/server/team-router/*.ts                        │
-│  - 使用 buildTeamWhereQuery 构建查询                           │
-│  - 获取用户角色进行层级检查                                        │
-│  - 抛出 AppErrorCode.UNAUTHORIZED                                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     UI 上下文层 (Context)                      │
-├─────────────────────────────────────────────────────────────────┤
-│  apps/remix/app/providers/team.tsx                          │
-│  - TeamProvider 提供 team.currentTeamRole                   │
-│  - useCurrentTeam() Hook                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-┌─────────────────────────────┐   ┌─────────────────────────────┐
-│     路由页面层             │   │     组件对话框层           │
-│   (Route Pages)          │   │   (Components/Dialogs)    │
-├─────────────────────────────┤   ├─────────────────────────────┤
-│ apps/remix/routes/...    │   │ apps/remix/components/   │
-│ - Loader 权限检查           │   │ - 按钮禁用状态        │
-│ - 页面级渲染控制         │   │ - 菜单项显示/隐藏      │
-│ - 错误页面展示           │   │ - 下拉选项过滤        │
-└─────────────────────────────┘   └─────────────────────────────┘
-```
-
-## 六、核心设计原则
-
-### 6.1 多层防护机制
-
-1. **配置层**：统一的角色权限映射定义
-2. **服务端Loader**：首次权限检查 + 无权限重定向
-3. **TRPC API层**：数据库查询级别的权限过滤 + 业务逻辑权限检查
-4. **UI组件层**：禁用/隐藏无权限操作按钮和菜单项
-
-### 6.2 角色层级设计
-
-- Admin > Manager > Member
-
-- 高角色可以管理低角色，但低角色不能管理高角色
-- 同级别之间不能互相管理
-
-### 6.3 权限收敛点
-
-1. **数据获取时收敛**：通过 `buildTeamWhereQuery` 在数据库查询层面过滤数据
-2. **操作执行前收敛**：通过 `canExecuteTeamAction` 检查操作权限
-3. **用户管理时收敛**：通过 `isTeamRoleWithinUserHierarchy` 检查层级权限
-4. **UI渲染时收敛**：通过禁用/隐藏UI元素防止用户看到无权限操作
-
-## 七、权限检查流程
-
-```
-用户访问团队设置页面
-    │
-    ▼
-Route Loader 执行
-    │
-    ├─► getTeamByUrl() 获取团队信息
-    │   └─► 构建带权限的数据库查询
-    │
-    └─► canExecuteTeamAction('MANAGE_TEAM', team.currentTeamRole)
-        └─► 无权限 → 重定向到团队首页
-        └─► 有权限 → 继续
-    │
-    ▼
-Client Component 渲染
-    │
-    └─► useCurrentTeam() 获取团队上下文
-    │
-    └─► canExecuteTeamAction('MANAGE_TEAM', team.currentTeamRole)
-        └─► 无权限 → 显示401错误页面
-        └─► 有权限 → 渲染设置页面
-    │
-    ▼
-子组件渲染（如成员表格）
-    │
-    └─► isTeamRoleWithinUserHierarchy(currentRole, targetRole)
-        └─► 无权限 → 禁用更新/删除按钮
-        └─► 有权限 → 启用按钮
-    │
-    ▼
-用户点击更新角色
-    │
-    └─► TeamMemberUpdateDialog 打开
-        └─► useEffect 再次检查层级权限
-        └─► 下拉选项仅显示层级内允许的角色
-    │
-    ▼
-提交更新请求
-    │
-    └─► TRPC updateTeamMemberRoute 执行
-        ├─► buildTeamWhereQuery 带 MANAGE_TEAM 权限角色
-        ├─► getMemberRoles 获取当前用户和目标用户角色
-        ├─► isTeamRoleWithinUserHierarchy 两次检查
-        └─► 执行更新操作
-```
+**权限检查位置**：权限检查分散在各个Route Loader和TRPC Procedure中，而非集中在中间件。

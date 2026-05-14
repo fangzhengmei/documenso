@@ -2,94 +2,130 @@
 
 ## 概述
 
-本文档描述了从用户在 PDF 页面上拖动/放置字段，到最终坐标入库存储的完整坐标转换流程。整个流程涉及多层坐标系统之间的转换，确保字段在不同缩放级别和不同 PDF 页面尺寸下都能正确显示。
+本文档详细描述了从用户交互（点击/拖拽/框选）到字段坐标最终入库，再到渲染还原的完整坐标转换流程。整个流程涉及多层坐标系统之间的转换，确保字段在不同缩放级别下都能正确显示。
 
 ---
 
 ## 坐标系统层级
 
-| 层级 | 坐标类型 | 范围 | 说明 |
-|------|---------|------|------|
-| 1 | 屏幕坐标 (clientX/Y) | 像素值 | 鼠标在浏览器视口中的位置 |
-| 2 | 页面像素坐标 | 像素值 | 相对于 PDF 页面左上角的像素位置 |
-| 3 | 百分比坐标 | 0-100 | 相对于页面宽高的百分比值（最终存储格式） |
+| 层级 | 坐标类型 | 单位 | 原点 | 说明 |
+|------|---------|------|------|------|
+| 1 | 屏幕坐标 (clientX/Y) | 像素 | 浏览器视口左上角 | 鼠标在视口中的位置 |
+| 2 | 文档坐标 (pageX/Y) | 像素 | 文档左上角 | 鼠标相对于整个文档的位置（含滚动） |
+| 3 | 页面相对像素坐标 | 像素 | PDF页面左上角 | 鼠标相对于PDF页面元素的位置 |
+| 4 | Konva Stage内部坐标 | 像素 | Stage左上角（= 页面左上角） | Konva画布坐标系（未缩放） |
+| 5 | 百分比坐标 | % (0-100) | PDF页面左上角 | 相对于页面宽高的百分比（最终存储格式） |
 
 ---
 
-## 详细转换流程
+## 完整转换流程
 
-### 场景一：通过拖拽按钮创建字段（Drag & Drop）
+### 第一阶段：交互坐标 → 页面坐标 → 百分比入库
+
+---
+
+#### 场景一：通过侧边栏按钮拖拽点击创建字段（Drag & Drop）
 
 **文件位置**: `apps/remix/app/components/general/envelope-editor/envelope-editor-fields-drag-drop.tsx`
 
-#### 1. 鼠标点击获取页面元素
+##### 1. 获取页面元素边界
 ```typescript
-// onMouseClick 事件处理
-const $page = getPage(event, PDF_VIEWER_PAGE_SELECTOR);
+// 关键函数：getBoundingClientRect($page)
+// 返回的是相对于文档的绝对坐标（已考虑滚动偏移）
 const { top, left, height, width } = getBoundingClientRect($page);
-const pageNumber = parseInt($page.getAttribute('data-page-number') ?? '1', 10);
+
+// getBoundingClientRect 内部实现：
+// const rect = element.getBoundingClientRect();
+// const top = rect.top + window.scrollY;   // 视口坐标 + 垂直滚动 = 文档坐标
+// const left = rect.left + window.scrollX;  // 视口坐标 + 水平滚动 = 文档坐标
 ```
 
-#### 2. 屏幕坐标 -> 页面相对像素坐标
+##### 2. 文档坐标 → 页面相对像素坐标
 ```typescript
-// 计算字段相对于页面的像素位置
-// event.pageX/Y = 鼠标相对于整个文档的像素位置
-// left/top = 页面相对于视口的像素位置
-let pageX = ((event.pageX - left) / width) * 100;
-let pageY = ((event.pageY - top) / height) * 100;
+// event.pageX/Y = 鼠标相对于文档左上角的像素坐标
+// left/top = 页面元素相对于文档左上角的像素坐标
+// 差值 = 鼠标相对于页面元素的像素位置
+const relativePixelX = event.pageX - left;
+const relativePixelY = event.pageY - top;
 ```
 
-#### 3. 计算字段尺寸的百分比
+##### 3. 像素坐标 → 百分比坐标
 ```typescript
+// (像素值 / 页面像素宽度) * 100 = 百分比
+let pageX = (relativePixelX / width) * 100;
+let pageY = (relativePixelY / height) * 100;
+
+// 字段尺寸也转换为百分比
 const fieldPageWidth = (fieldBounds.current.width / width) * 100;
 const fieldPageHeight = (fieldBounds.current.height / height) * 100;
 ```
 
-#### 4. 居中调整（鼠标位置为字段中心）
+##### 4. 居中调整（鼠标位置为字段中心点）
 ```typescript
-// 将字段中心对齐到鼠标点击位置
+// 将字段左上角对齐到（鼠标位置 - 字段一半尺寸）
 pageX -= fieldPageWidth / 2;
 pageY -= fieldPageHeight / 2;
 ```
 
-#### 5. 创建字段对象（百分比坐标）
+##### 5. 最终字段对象（百分比坐标，准备入库）
 ```typescript
 const field = {
   formId: nanoid(12),
-  envelopeItemId: selectedEnvelopeItemId,
-  type: selectedField,
   page: pageNumber,
   positionX: pageX,      // 百分比 (0-100)
   positionY: pageY,      // 百分比 (0-100)
   width: fieldPageWidth, // 百分比 (0-100)
   height: fieldPageHeight, // 百分比 (0-100)
-  recipientId: selectedRecipientId,
-  fieldMeta: {...},
+  // ...其他字段
 };
+
+editorFields.addField(field);
 ```
 
 ---
 
-### 场景二：通过框选区域创建字段（Selection Rectangle）
+#### 场景二：通过在PDF上框选区域创建字段（Selection Rectangle）
 
 **文件位置**: `apps/remix/app/components/general/envelope-editor/envelope-editor-fields-page-renderer.tsx`
 
-#### 1. 获取框选区域的像素坐标（Konva Stage）
+##### 1. Konva Stage 初始化（关键！理解缩放机制）
 ```typescript
-// Konva Stage 上的坐标已经是相对于页面的像素坐标
-const pixelWidth = pendingFieldCreation.width();
+// usePageRenderer.ts 中的 Stage 初始化
+stage.current = new Konva.Stage({
+  container,
+  width: scaledViewport.width,   // pageWidth * scale
+  height: scaledViewport.height, // pageHeight * scale
+  scale: {
+    x: scale,  // Stage 级别的缩放因子
+    y: scale,
+  },
+});
+```
+
+**重要说明**：
+- **Stage 的实际像素尺寸** = `pageWidth * scale`（显示在屏幕上的大小）
+- **Stage 的内部逻辑坐标** = 仍然使用 `pageWidth/pageHeight`（未缩放）
+- Konva 会自动将内部逻辑坐标应用 `scale` 后渲染到屏幕
+
+##### 2. 获取框选区域的 Konva 内部坐标（未缩放）
+```typescript
+// Selection Rectangle 是在 Stage 内部绘制的
+// 所以获取的 x/y/width/height 是相对于 unscaledViewport 的逻辑坐标
+const pixelWidth = pendingFieldCreation.width();   // 逻辑像素（未缩放）
 const pixelHeight = pendingFieldCreation.height();
 const pixelX = pendingFieldCreation.x();
 const pixelY = pendingFieldCreation.y();
 ```
 
-#### 2. 使用工具函数转换像素 -> 百分比
+##### 3. 使用工具函数转换：逻辑像素 → 百分比
 **文件位置**: `packages/lib/universal/field-renderer/field-renderer.ts`
 
 ```typescript
+// convertPixelToPercentage 内部实现
 export const convertPixelToPercentage = (options) => {
   const { positionX, positionY, width, height, pageWidth, pageHeight } = options;
 
+  // 注意：这里的 pageWidth/pageHeight 是 unscaledViewport（原始PDF尺寸）
   const fieldX = (positionX / pageWidth) * 100;
   const fieldY = (positionY / pageHeight) * 100;
   const fieldWidth = (width / pageWidth) * 100;
@@ -99,43 +135,46 @@ export const convertPixelToPercentage = (options) => {
 };
 ```
 
-#### 3. 调用示例
+##### 4. 调用示例（使用 unscaledViewport）
 ```typescript
+// 关键：使用 unscaledViewport（因为 Konva 坐标是逻辑坐标）
 const { fieldX, fieldY, fieldWidth, fieldHeight } = convertPixelToPercentage({
   width: pixelWidth,
   height: pixelHeight,
   positionX: pixelX,
   positionY: pixelY,
-  pageWidth: unscaledViewport.width,   // 页面原始宽度（像素）
-  pageHeight: unscaledViewport.height, // 页面原始高度（像素）
+  pageWidth: unscaledViewport.width,   // = pageWidth (原始PDF宽度)
+  pageHeight: unscaledViewport.height, // = pageHeight (原始PDF高度)
 });
 ```
 
 ---
 
-### 场景三：字段拖拽移动或调整大小（Drag & Resize）
+#### 场景三：字段拖拽移动或调整大小后保存（Drag & Resize）
 
 **文件位置**: `apps/remix/app/components/general/envelope-editor/envelope-editor-fields-page-renderer.tsx`
 
-#### 1. 获取字段当前的像素边界
+##### 1. 获取字段当前的屏幕像素边界
 ```typescript
 const handleResizeOrMove = (event: KonvaEventObject<Event>) => {
   const isDragEvent = event.type === 'dragend';
   const fieldGroup = event.target as Konva.Group;
   
-  // 获取字段的像素边界（已考虑缩放）
+  // 关键：getClientRect() 返回的是已应用 Stage scale 的屏幕像素坐标
+  // 因为 Stage 本身有 scale 缩放，所以这里获取的值是 "显示像素"
   const {
-    width: fieldPixelWidth,
-    height: fieldPixelHeight,
-    x: fieldX,
-    y: fieldY,
+    width: fieldPixelWidth,   // 已缩放的屏幕像素
+    height: fieldPixelHeight, // 已缩放的屏幕像素
+    x: fieldX,                // 已缩放的屏幕像素
+    y: fieldY,                // 已缩放的屏幕像素
   } = fieldGroup.getClientRect({ skipStroke: true, skipShadow: true });
 ```
 
-#### 2. 像素坐标 -> 百分比坐标
+##### 2. 已缩放的像素坐标 → 百分比坐标
 ```typescript
-  const pageHeight = scaledViewport.height;
-  const pageWidth = scaledViewport.width;
+  // 关键：使用 scaledViewport（因为 getClientRect 返回的是缩放后的坐标）
+  const pageHeight = scaledViewport.height;  // pageHeight * scale
+  const pageWidth = scaledViewport.width;    // pageWidth * scale
 
   // 计算位置百分比
   const positionPercentX = (fieldX / pageWidth) * 100;
@@ -146,7 +185,7 @@ const handleResizeOrMove = (event: KonvaEventObject<Event>) => {
   const fieldPageHeight = (fieldPixelHeight / pageHeight) * 100;
 ```
 
-#### 3. 更新字段状态
+##### 3. 更新字段状态
 ```typescript
   const fieldUpdates: Partial<TLocalField> = {
     positionX: positionPercentX,
@@ -165,44 +204,7 @@ const handleResizeOrMove = (event: KonvaEventObject<Event>) => {
 
 ---
 
-### 场景四：字段渲染（百分比 -> 像素）
-
-**文件位置**: `packages/lib/universal/field-renderer/field-renderer.ts`
-
-#### 1. 百分比坐标 -> 像素坐标
-```typescript
-export const calculateFieldPosition = (field, pageWidth, pageHeight) => {
-  // 百分比 -> 像素
-  const fieldWidth = pageWidth * (Number(field.width) / 100);
-  const fieldHeight = pageHeight * (Number(field.height) / 100);
-  const fieldX = pageWidth * (Number(field.positionX) / 100);
-  const fieldY = pageHeight * (Number(field.positionY) / 100);
-
-  return { fieldX, fieldY, fieldWidth, fieldHeight };
-};
-```
-
-#### 2. 渲染时调用（Konva Canvas）
-**文件位置**: `packages/lib/universal/field-renderer/render-field.ts`
-
-```typescript
-// 在 renderField 函数中
-const { fieldX, fieldY, fieldWidth, fieldHeight } = calculateFieldPosition(
-  field,
-  pageWidth,
-  pageHeight
-);
-
-// 应用缩放因子
-const scaledX = fieldX * scale;
-const scaledY = fieldY * scale;
-const scaledWidth = fieldWidth * scale;
-const scaledHeight = fieldHeight * scale;
-```
-
----
-
-### 场景五：数据库存储与读取
+### 第二阶段：数据库存储
 
 #### 1. 字段状态管理（本地）
 **文件位置**: `packages/lib/client-only/hooks/use-editor-fields.ts`
@@ -216,7 +218,7 @@ export const ZLocalFieldSchema = z.object({
   type: z.nativeEnum(FieldType),
   recipientId: z.number(),
   page: z.number().min(1),
-  positionX: z.number().min(0),  // 百分比
+  positionX: z.number().min(0),  // 百分比（核心存储格式）
   positionY: z.number().min(0),  // 百分比
   width: z.number().min(0),      // 百分比
   height: z.number().min(0),     // 百分比
@@ -224,7 +226,7 @@ export const ZLocalFieldSchema = z.object({
 });
 ```
 
-#### 2. 边界限制
+#### 2. 边界限制函数
 ```typescript
 const restrictFieldPosValues = (field) => {
   return {
@@ -236,7 +238,7 @@ const restrictFieldPosValues = (field) => {
 };
 ```
 
-#### 3. 服务端创建字段
+#### 3. 服务端写入数据库
 **文件位置**: `packages/lib/server-only/field/create-envelope-fields.ts`
 
 ```typescript
@@ -245,184 +247,157 @@ const newlyCreatedFields = await tx.field.createManyAndReturn({
   data: validatedFields.map((field) => ({
     type: field.type,
     page: field.page,
-    positionX: field.positionX,  // 百分比
-    positionY: field.positionY,  // 百分比
-    width: field.width,          // 百分比
-    height: field.height,        // 百分比
-    customText: '',
-    inserted: false,
-    fieldMeta: field.fieldMeta,
-    envelopeId: envelope.id,
-    envelopeItemId: field.envelopeItemId,
-    recipientId: field.recipientId,
+    positionX: field.positionX,  // DECIMAL 类型，存储百分比
+    positionY: field.positionY,  // DECIMAL 类型
+    width: field.width,          // DECIMAL 类型
+    height: field.height,        // DECIMAL 类型
+    // ...其他字段
   })),
 });
 ```
 
 ---
 
-### 场景六：AI 检测字段的坐标转换
+### 第三阶段：渲染还原（百分比 → 像素 → 屏幕显示）
 
-**文件位置**: `packages/lib/server-only/field/create-envelope-fields.ts`
+#### 1. 百分比坐标 → Konva 逻辑像素坐标
+**文件位置**: `packages/lib/universal/field-renderer/field-renderer.ts`
 
-#### 1. PDF 原始坐标（左下角原点）
 ```typescript
-// PDF 内部坐标系统：原点在左下角，单位是 point
-// match.bbox = { x, y, width, height } (points)
-// page.height = 页面高度 (points)
-```
+export const calculateFieldPosition = (field, pageWidth, pageHeight) => {
+  // pageWidth/pageHeight = unscaledViewport（原始PDF尺寸）
+  // 百分比 → 逻辑像素
+  const fieldWidth = pageWidth * (Number(field.width) / 100);
+  const fieldHeight = pageHeight * (Number(field.height) / 100);
+  const fieldX = pageWidth * (Number(field.positionX) / 100);
+  const fieldY = pageHeight * (Number(field.positionY) / 100);
 
-#### 2. 转换为左上角原点的百分比坐标
-```typescript
-// 1. Y 轴翻转（左下角 -> 左上角）
-const topLeftY = page.height - match.bbox.y - match.bbox.height;
-
-// 2. 像素/点 -> 百分比
-const widthPercent = (match.bbox.width / page.width) * 100;
-const heightPercent = (match.bbox.height / page.height) * 100;
-
-// 3. 最终字段坐标
-return {
-  positionX: (match.bbox.x / page.width) * 100,
-  positionY: (topLeftY / page.height) * 100,
-  width: widthPercent,
-  height: heightPercent,
-  page: match.pageIndex + 1,
-  // ...其他字段
+  return { fieldX, fieldY, fieldWidth, fieldHeight };
 };
 ```
 
+#### 2. 渲染时设置字段 Group 位置
+**文件位置**: `packages/lib/universal/field-renderer/field-generic-items.ts`
+
+```typescript
+export const upsertFieldGroup = (field: FieldToRender, options: RenderFieldElementOptions): Konva.Group => {
+  const { pageWidth, pageHeight, pageLayer, editable, scale } = options;
+
+  // 1. 百分比 → 逻辑像素（未缩放）
+  const { fieldX, fieldY, fieldWidth, fieldHeight } = calculateFieldPosition(field, pageWidth, pageHeight);
+
+  const fieldGroup: Konva.Group =
+    pageLayer.findOne(`#${field.renderId}`) || new Konva.Group({ ... });
+
+  // 2. 拖拽边界考虑 scale（因为拖拽返回的是屏幕像素坐标）
+  const maxXPosition = (pageWidth - fieldWidth) * scale;
+  const maxYPosition = (pageHeight - fieldHeight) * scale;
+
+  // 3. 设置 Group 位置（注意：x/y 使用的是未缩放的逻辑像素）
+  fieldGroup.setAttrs({
+    scaleX: 1,       // Group 自身不缩放
+    scaleY: 1,
+    x: fieldX,       // 逻辑像素坐标（未缩放）
+    y: fieldY,       // Konva Stage 的 scale 会自动应用
+    draggable: editable,
+    dragBoundFunc: (pos) => {
+      const newX = Math.max(0, Math.min(maxXPosition, pos.x));
+      const newY = Math.max(0, Math.min(maxYPosition, pos.y));
+      return { x: newX, y: newY };
+    },
+  });
+
+  return fieldGroup;
+};
+```
+
+#### 3. Konva 自动缩放机制
+```
+数据库百分比坐标
+    ↓ (calculateFieldPosition)
+Konva 逻辑像素坐标 (x, y, width, height)
+    ↓ (Stage.scale 自动应用)
+屏幕显示像素坐标 = 逻辑像素 * scale
+```
+
+**关键点**：字段元素本身从不设置 `scaleX/Y`，缩放完全由 Stage 统一管理，确保所有元素的缩放一致。
+
 ---
 
-## 完整流程示意图
+## 坐标转换总结表
 
+| 操作场景 | 输入坐标 | 使用的 Viewport | 转换方向 | 核心公式 |
+|---------|---------|----------------|---------|---------|
+| 侧边按钮点击创建 | 鼠标文档坐标 (pageX/Y) | 页面DOM元素的 bounding rect | 像素 → 百分比 | `((event.pageX - left) / width) * 100` |
+| 框选区域创建 | Konva 逻辑坐标 | unscaledViewport | 像素 → 百分比 | `(pixelX / pageWidth) * 100` |
+| 拖拽/调整大小后 | getClientRect() 已缩放坐标 | scaledViewport | 像素 → 百分比 | `(fieldX / (pageWidth * scale)) * 100` |
+| 字段渲染 | 数据库百分比 | unscaledViewport | 百分比 → 像素 | `pageWidth * (positionX / 100)` |
+
+---
+
+## Viewport 详解
+
+### unscaledViewport（未缩放视口）
+**定义**：PDF 文档的原始像素尺寸
+```typescript
+const unscaledViewport = {
+  scale: 1,
+  width: pageWidth,   // PDF 原始宽度（像素）
+  height: pageHeight, // PDF 原始高度（像素）
+};
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    用户交互阶段                                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────┐     鼠标点击/拖拽     ┌─────────────────┐   │
-│  │  鼠标指针    │ ───────────────────> │  clientX/Y     │   │
-│  │  (屏幕)      │                        │  (屏幕像素)    │   │
-│  └──────────────┘                        └────────┬────────┘   │
-│                                                    │            │
-│                                                    ▼            │
-│                                          ┌─────────────────┐   │
-│                                          │ getBoundingCli │   │
-│                                          │ entRect($page)  │   │
-│                                          │ 获取页面边界    │   │
-│                                          └────────┬────────┘   │
-│                                                    │            │
-│                                                    ▼            │
-│                                          ┌─────────────────┐   │
-│                                          │ 像素相对位置    │   │
-│                                          │ (pageX - left) │   │
-│                                          └────────┬────────┘   │
-│                                                    │            │
-│                                                    ▼            │
-│                                          ┌─────────────────┐   │
-│                                          │  百分比计算     │   │
-│                                          │  (px / width)  │   │
-│                                          │      * 100     │   │
-│                                          └────────┬────────┘   │
-│                                                    │            │
-└────────────────────────────────────────────────────┼────────────┘
-                                                     │
-                                                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    数据存储阶段                                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────┐                                          │
-│  │  本地状态    │  useEditorFields                        │
-│  │  (React)     │  TLocalField { positionX, Y, W, H }    │
-│  └──────┬───────┘                                          │
-│         │                                                    │
-│         ▼                                                    │
-│  ┌──────────────┐     TRPC API调用     ┌─────────────────┐   │
-│  │  自动保存    │ ───────────────────> │  createEnvelope │   │
-│  │  (AutoSave)  │                        │    Fields      │   │
-│  └──────────────┘                        └────────┬────────┘   │
-│                                                    │            │
-│                                                    ▼            │
-│                                          ┌─────────────────┐   │
-│                                          │   Prisma DB     │   │
-│                                          │   Field 表      │   │
-│                                          │  positionX (DECIMAL)│
-│                                          └─────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-                                                     │
-                                                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    字段渲染阶段                                   │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────┐                                          │
-│  │  数据库读取   │  SELECT positionX, Y, W, H            │
-│  └──────┬───────┘                                          │
-│         │                                                    │
-│         ▼                                                    │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │  calculateFieldPosition(field, pageWidth, pageHeight)│   │
-│  │  fieldX = pageWidth * (positionX / 100)             │   │
-│  │  fieldY = pageHeight * (positionY / 100)            │   │
-│  └──────────────────────┬──────────────────────────────┘   │
-│                         │                                       │
-│                         ▼                                       │
-│            ┌──────────────────────────────┐                │
-│            │  Konva Group (x, y, width, height)          │   │
-│            │    renderField() 渲染到 Canvas               │   │
-│            └──────────────────────────────┘                │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+
+**使用场景**：
+- 框选区域创建字段时的坐标转换
+- 字段渲染时 `calculateFieldPosition` 计算逻辑像素
+- `renderField` 调用时传入 `pageWidth/pageHeight`
+
+### scaledViewport（缩放后视口）
+**定义**：考虑显示缩放因子后的屏幕像素尺寸
+```typescript
+const scaledViewport = {
+  scale: scale,
+  width: pageWidth * scale,   // 屏幕上显示的宽度
+  height: pageHeight * scale, // 屏幕上显示的高度
+};
 ```
+
+**使用场景**：
+- Konva Stage 的 `width/height` 设置
+- 字段拖拽/调整大小后，`getClientRect()` 返回值的转换
+- 拖拽边界 `maxXPosition/maxYPosition` 的计算
+
+---
+
+## 常见问题与注意事项
+
+### Q1: 为什么拖拽移动时不更新 width/height？
+A: `getClientRect()` 在字段仅移动不缩放时，返回的宽高可能因浮点精度问题产生微小变化。为避免这种"无意义"的更新导致字段轻微"抖动"，仅在 `transformend`（调整大小）时才更新宽高。
+
+### Q2: Konva Stage.scale 是如何工作的？
+A: Stage.scale 是一个矩阵变换，会应用到所有子元素。设置子元素的 `x=100` 时：
+- Konva 内部逻辑坐标：x=100
+- 实际渲染到屏幕：x = 100 * scale
+
+### Q3: dragBoundFunc 为什么要乘 scale？
+A: 拖拽事件回调中的 `pos.x/pos.y` 是**屏幕像素坐标**（已应用 scale），所以边界限制也需要用 `pageWidth * scale` 来计算。
+
+### Q4: 为什么有两套坐标转换函数？
+A: 不是两套，而是同一转换的正反方向：
+- `convertPixelToPercentage`: 像素 → 百分比（写入）
+- `calculateFieldPosition`: 百分比 → 像素（读取）
 
 ---
 
 ## 关键文件索引
 
-| 功能模块 | 文件路径 | 核心函数 |
-|---------|---------|---------|
-| 拖拽创建字段 | `envelope-editor-fields-drag-drop.tsx` | `onMouseClick` |
-| 框选创建字段 | `envelope-editor-fields-page-renderer.tsx` | `createFieldFromPendingTemplate` |
-| 拖拽/调整大小 | `envelope-editor-fields-page-renderer.tsx` | `handleResizeOrMove` |
-| 像素转百分比 | `field-renderer.ts` | `convertPixelToPercentage` |
-| 百分比转像素 | `field-renderer.ts` | `calculateFieldPosition` |
+| 功能模块 | 文件路径 | 核心函数/变量 |
+|---------|---------|-------------|
+| DOM 边界获取 | `packages/lib/client-only/get-bounding-client-rect.ts` | `getBoundingClientRect` |
+| 视口定义 | `packages/lib/client-only/hooks/use-page-renderer.ts` | `unscaledViewport`, `scaledViewport` |
+| 像素百分比互转 | `packages/lib/universal/field-renderer/field-renderer.ts` | `convertPixelToPercentage`, `calculateFieldPosition` |
+| 侧边栏拖拽创建 | `envelope-editor-fields-drag-drop.tsx` | `onMouseClick` |
+| 框选创建/拖拽移动 | `envelope-editor-fields-page-renderer.tsx` | `createFieldFromPendingTemplate`, `handleResizeOrMove` |
+| 字段Group渲染 | `field-generic-items.ts` | `upsertFieldGroup` |
 | 字段状态管理 | `use-editor-fields.ts` | `addField`, `updateFieldByFormId` |
 | 服务端创建 | `create-envelope-fields.ts` | `createEnvelopeFields` |
-| 字段渲染 | `render-field.ts` | `renderField` |
-
----
-
-## 注意事项
-
-### 1. 坐标原点
-- **屏幕坐标**: 左上角为原点 (0,0)
-- **PDF 页面渲染**: 左上角为原点 (0,0)
-- **PDF 原始内部坐标**: 左下角为原点 (0,0) ⚠️
-
-### 2. 精度问题
-- 百分比坐标使用小数存储（例如 23.4567）
-- 像素与百分比之间的来回转换可能有微小误差
-- 拖拽移动时不更新宽高以避免累积误差
-
-### 3. 缩放因子 (Scale)
-- Konva Stage 应用了缩放因子
-- 在 `handleResizeOrMove` 中使用 `scaledViewport`（已缩放）
-- 在 `convertPixelToPercentage` 中使用 `unscaledViewport`（未缩放）
-
-### 4. 边界限制
-- 所有坐标值限制在 [0, 100] 范围内
-- 通过 `restrictFieldPosValues` 函数强制约束
-
----
-
-## 相关常量定义
-
-**文件位置**: `packages/lib/universal/field-renderer/field-renderer.ts`
-
-```typescript
-export const MIN_FIELD_WIDTH_PX = 36;   // 字段最小宽度（像素）
-export const MIN_FIELD_HEIGHT_PX = 12;  // 字段最小高度（像素）
-```

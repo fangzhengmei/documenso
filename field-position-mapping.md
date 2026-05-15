@@ -159,19 +159,19 @@ const { fieldX, fieldY, fieldWidth, fieldHeight } = convertPixelToPercentage({
 
 **文件位置**: `apps/remix/app/components/general/envelope-editor/envelope-editor-fields-page-renderer.tsx`
 
-##### 1. 获取字段当前的屏幕像素边界
+##### 1. 获取字段当前的绝对坐标边界
 ```typescript
 const handleResizeOrMove = (event: KonvaEventObject<Event>) => {
   const isDragEvent = event.type === 'dragend';
   const fieldGroup = event.target as Konva.Group;
   
-  // 关键：getClientRect() 返回的是已应用 Stage scale 的屏幕像素坐标
-  // 因为 Stage 本身有 scale 缩放，所以这里获取的值是 "显示像素"
+  // 关键：getClientRect() 返回的是已应用 Stage scale 的绝对坐标
+  // 与 group.absolutePosition() 和 dragBoundFunc pos.x/y 同坐标系
   const {
-    width: fieldPixelWidth,   // 已缩放的屏幕像素
-    height: fieldPixelHeight, // 已缩放的屏幕像素
-    x: fieldX,                // 已缩放的屏幕像素
-    y: fieldY,                // 已缩放的屏幕像素
+    width: fieldPixelWidth,   // 绝对坐标空间的宽度
+    height: fieldPixelHeight, // 绝对坐标空间的高度
+    x: fieldX,                // 绝对坐标空间的X
+    y: fieldY,                // 绝对坐标空间的Y
   } = fieldGroup.getClientRect({ skipStroke: true, skipShadow: true });
 ```
 
@@ -399,14 +399,33 @@ const scaledViewport = {
 A: `getClientRect()` 在字段仅移动不缩放时，返回的宽高可能因浮点精度问题产生微小变化。为避免这种"无意义"的更新导致字段轻微"抖动"，仅在 `transformend`（调整大小）时才更新宽高。
 
 ### Q2: Konva Stage.scale 是如何工作的？
-A: Stage.scale 是一个矩阵变换，会应用到所有子元素。设置子元素的 `x=100` 时：
-- Konva 内部逻辑坐标：x=100
-- 实际渲染到屏幕：x = 100 * scale
+A: Stage.scale 是一个矩阵变换，会应用到所有子元素的渲染，但不会改变元素存储的逻辑坐标。
+
+设置子元素的 `x=100` 时：
+- `group.x()` 读取到的值：100（逻辑坐标，未缩放）
+- `group.absolutePosition().x`：100 * scale（绝对坐标，已缩放）
+- 实际渲染到屏幕的视觉位置：100 * scale
 
 ### Q3: dragBoundFunc 为什么要乘 scale？
-A: 拖拽事件回调中的 `pos.x/pos.y` 是**屏幕像素坐标**（已应用 scale），所以边界限制也需要用 `pageWidth * scale` 来计算。
+A: 拖拽事件回调中的 `pos.x/pos.y` 是**绝对坐标**（已包含所有父级 scale 变换），不是屏幕像素，也不是逻辑坐标。
 
-### Q4: 为什么有两套坐标转换函数？
+为了让边界值与 `pos.x` 在同一坐标系中比较，必须：
+```typescript
+maxXPosition = (pageWidth - fieldWidth) * scale
+```
+
+这样 `Math.min(maxXPosition, pos.x)` 才能正确限制边界。
+
+> 详细数学证明参考：coordinate-semantic-consistency.md 第 6 节
+
+### Q4: "绝对坐标"和"屏幕像素"是一回事吗？
+A: 不一定。绝对坐标是相对于 Stage 容器左上角的坐标空间：
+- 如果 Stage 在页面中没有偏移且没有嵌套滚动，绝对坐标 ≈ 相对于 Stage 的屏幕像素
+- 如果 Stage 有偏移或嵌套在滚动容器中，两者会有差值
+
+在本项目中，绝对坐标与 `group.absolutePosition()` 和 `getClientRect()` 的返回值处于同一坐标系。
+
+### Q5: 为什么有两套坐标转换函数？
 A: 不是两套，而是同一转换的正反方向：
 - `convertPixelToPercentage`: 像素 → 百分比（写入）
 - `calculateFieldPosition`: 百分比 → 像素（读取）

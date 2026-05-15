@@ -289,7 +289,9 @@ export const upsertFieldGroup = (field: FieldToRender, options: RenderFieldEleme
   const fieldGroup: Konva.Group =
     pageLayer.findOne(`#${field.renderId}`) || new Konva.Group({ ... });
 
-  // 2. 拖拽边界考虑 scale（因为拖拽返回的是屏幕像素坐标）
+  // 2. 拖拽边界考虑 scale（因为拖拽回调 pos.x/y 是显示坐标）
+  // 重要：dragBoundFunc 的入参 pos.x/y 是"显示坐标"
+  // 即：逻辑坐标 × Stage.scale，与 getClientRect() 返回值同坐标系
   const maxXPosition = (pageWidth - fieldWidth) * scale;
   const maxYPosition = (pageHeight - fieldHeight) * scale;
 
@@ -298,12 +300,14 @@ export const upsertFieldGroup = (field: FieldToRender, options: RenderFieldEleme
     scaleX: 1,       // Group 自身不缩放
     scaleY: 1,
     x: fieldX,       // 逻辑像素坐标（未缩放）
-    y: fieldY,       // Konva Stage 的 scale 会自动应用
+    y: fieldY,       // Konva Stage 的 scale 会自动应用到渲染
     draggable: editable,
     dragBoundFunc: (pos) => {
+      // pos.x/y 是显示坐标（已应用 Stage.scale）
+      // 边界值 maxXPosition/maxYPosition 也必须用显示坐标计算
       const newX = Math.max(0, Math.min(maxXPosition, pos.x));
       const newY = Math.max(0, Math.min(maxYPosition, pos.y));
-      return { x: newX, y: newY };
+      return { x: newX, y: newY };  // Konva 会自动转换回逻辑坐标
     },
   });
 
@@ -315,12 +319,27 @@ export const upsertFieldGroup = (field: FieldToRender, options: RenderFieldEleme
 ```
 数据库百分比坐标
     ↓ (calculateFieldPosition)
-Konva 逻辑像素坐标 (x, y, width, height)
-    ↓ (Stage.scale 自动应用)
-屏幕显示像素坐标 = 逻辑像素 * scale
+Konva 逻辑像素坐标 (x, y, width, height)  ← group.x()/group.y() 获取的值
+    ↓ (Stage.scale 自动应用于渲染)
+屏幕显示像素坐标 = 逻辑像素 × scale         ← pos.x / getClientRect() 获取的值
 ```
 
-**关键点**：字段元素本身从不设置 `scaleX/Y`，缩放完全由 Stage 统一管理，确保所有元素的缩放一致。
+**关键点**：
+- 字段元素本身从不设置 `scaleX/Y`，缩放完全由 Stage 统一管理
+- `group.x()` / `group.y()` 获取的是**逻辑坐标**（未缩放）
+- `dragBoundFunc` 的 `pos.x / pos.y` 是**显示坐标**（已缩放）
+- 两者关系：`pos.x = group.x() * scale`
+
+#### 4. 数值验证示例（pageWidth=800, fieldWidth=100, scale=0.75）
+
+| 场景 | 计算过程 | 结果 |
+|-----|---------|------|
+| 最大逻辑X | `800 - 100` | 700px |
+| 边界值（显示坐标） | `700 * 0.75` | 525px |
+| 拖拽 pos.x=525 时 | `group.x() = 525 / 0.75` | 700px ✓ |
+| 字段右下角 | `700 + 100` | 800px（刚好不超出边界） |
+
+> 详细验证请参考：`drag-bound-coordinate-check.md`
 
 ---
 

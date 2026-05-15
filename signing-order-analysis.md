@@ -252,7 +252,7 @@ if (isComplete) {
 - [ ] `DOCUMENT_REJECTED` Webhook 必须在封存任务完成后才触发
 - [ ] 拒绝路径不应触发任何 `DOCUMENT_SIGNED` 事件
 - [ ] 拒绝文档的 PDF 必须包含拒绝印章
-- [ ] 拒绝文档不生成签署证书
+- [ ] 证书生成由 `includeSigningCertificate` 配置决定，与文档是否 REJECTED 无直接开关关系
 - [ ] 两种路径都必须经过 PROCESSING 过渡状态
 - [ ] envelope.status 的更新只能在封存任务内完成
 
@@ -372,6 +372,8 @@ export async function getIsRecipientsTurnToSign({ token }) {
 
 ---
 
-**报告版本**：v2.0（定点修订版）
-**核对范围**：状态机完整链路、时序边界、触发顺序、路径对照
+**报告版本**：v2.1（事实点修正版）
+**核对范围**：状态机完整链路、时序边界、触发顺序、路径对照、证书生成逻辑
 **可直接用于实现核对**：✅ 是
+
+**本次修正**：纠正拒绝路径签署证书生成逻辑 - 证书生成仅取决于团队配置 `includeSigningCertificate`，与文档是否拒绝无直接开关关系。

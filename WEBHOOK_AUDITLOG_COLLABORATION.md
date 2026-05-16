@@ -171,6 +171,9 @@ await this._queue.add(
 **重试状态管理** (第 283-295 行):
 ```typescript
 if (backgroundJobId) {
+  // 关键判断逻辑: attemptsMade >= attempts - 1
+  // 当 attempts=3 时: attemptsMade >= 2 → 第 3 次尝试 (0,1,2) 即为最后一次
+  // 证明 BullMQ attempts 是总尝试次数, 而非重试次数
   const isFinalAttempt = job.attemptsMade >= (job.opts.attempts ?? DEFAULT_MAX_RETRIES) - 1;
 
   await prisma.backgroundJob
@@ -204,7 +207,6 @@ if (backgroundJobId) {
 4b. 失败 → 进入重试队列:
     - 第 1 次重试: 1 秒后执行
     - 第 2 次重试: 2 秒后执行
-    - 第 3 次重试: 4 秒后执行
     ↓
 5. 所有重试失败 → 标记 BackgroundJob=FAILED, WebhookCall=FAILED
 ```

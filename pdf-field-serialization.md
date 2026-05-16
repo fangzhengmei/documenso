@@ -299,17 +299,20 @@ function parseCheckboxCustomText(customText: string): number[] {
 }
 ```
 
-### 2. fromCheckboxValue (字段验证用)
+### 2. fromCheckboxValue / toCheckboxValue (通用复选框转换)
 **文件**: `packages/lib/universal/field-checkbox.ts`
+
+> **⚠️ 核对结论：与签署提交流程和渲染流程无关，仅用于 V1 遗留 API 和特定验证场景**
+> 签署 → 存储使用 `toCheckboxCustomText`，存储 → 渲染使用 `parseCheckboxCustomText`
 
 ```typescript
 /**
- * ⚠️ 重要修正：此函数返回的是 number[] 索引数组，而非 string[] 值数组
+ * 从 customText 反序列化为字符串数组
  * 
- * 此函数用于只读字段值验证场景，不是渲染时的文本映射
- * 渲染时需要结合 fieldMeta.values 手动将索引映射到文本值
+ * 【返回类型】: string[]，不是 number[]
+ * 【fallback 行为】: JSON 解析失败时，直接按逗号分割字符串，不做 Number 转换
  */
-function fromCheckboxValue(customText: string): number[] {
+function fromCheckboxValue(customText: string): string[] {
   if (!customText) {
     return [];
   }
@@ -321,11 +324,20 @@ function fromCheckboxValue(customText: string): number[] {
       throw new Error('Parsed checkbox values are not an array');
     }
     
-    return parsed;  // 返回 number[] 索引数组
+    return parsed;  // 返回 string[]，取决于存入时的格式
   } catch {
-    // 兼容旧格式：逗号分隔的字符串（如 "0,2" → ["0", "2"]）
-    return customText.split(',').filter(Boolean).map(Number);
+    // 兼容旧格式：逗号分隔字符串 → ["0","2"]（字符串数组，不是数字）
+    return customText.split(',').filter(Boolean);
   }
+}
+
+/**
+ * 将字符串数组序列化为 JSON 字符串
+ * 
+ * 【输入类型】: string[]，不是 number[]
+ */
+function toCheckboxValue(values: string[]): string {
+  return JSON.stringify(values);
 }
 ```
 

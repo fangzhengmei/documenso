@@ -148,7 +148,7 @@ await triggerWebhook({
 
 **队列配置参数** (`packages/lib/jobs/client/bullmq.ts:23-25`):
 ```typescript
-const DEFAULT_MAX_RETRIES = 3;           // 最多重试 3 次
+const DEFAULT_MAX_RETRIES = 3;           // BullMQ attempts 表示总尝试次数
 const DEFAULT_BACKOFF_DELAY = 1000;       // 初始延迟 1 秒
 ```
 
@@ -159,10 +159,10 @@ await this._queue.add(
   { name: options.name, payload: options.payload, backgroundJobId },
   {
     jobId: options.id,
-    attempts: DEFAULT_MAX_RETRIES,        // 总尝试次数 = 1 次首次 + 3 次重试
+    attempts: DEFAULT_MAX_RETRIES,        // 总尝试次数 = 1 次首次 + 2 次重试，依据 BullMQ API 语义
     backoff: {
       type: 'exponential',                // 指数退避策略
-      delay: DEFAULT_BACKOFF_DELAY,       // 延迟: 1s → 2s → 4s
+      delay: DEFAULT_BACKOFF_DELAY,       // 延迟: 1s → 2s
     },
   },
 );

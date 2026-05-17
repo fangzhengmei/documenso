@@ -80,25 +80,22 @@ export const authenticatedMiddleware = <T, R>(handler: ...) => {
 export const authenticatedMiddleware = t.middleware(async ({ ctx, next, path, meta }) => {
   const authorizationHeader = ctx.req.headers.get('authorization');
 
-  // 通过 meta.openapi.path 判断是否为 API V2 请求
   const isApiV2 = Boolean(meta?.openapi?.path);
 
+  // 分支 1: 有 Authorization 头且是 API V2 请求
   if (authorizationHeader && isApiV2) {
-    // 1. 提取 token (与 V1 相同逻辑)
     const [token] = (authorizationHeader || '').split('Bearer ').filter((s) => s.length > 0);
 
     if (!token) {
-      // ⚠️ 注意: 这里抛出的是通用 Error 而非 AppError
+      // 子场景 B: 有头但 token 为空 → 抛出普通 Error
       throw new Error('Token was not provided for authenticated middleware');
     }
 
-    // 2. 验证 token (调用相同的 getApiTokenByToken)
     const apiToken = await getApiTokenByToken({ token });
 
     // ⚠️ 注意: 这里缺少 user.disabled 检查！
     // ❌ 没有 if (apiToken.user.disabled) 的检查逻辑
 
-    // 3. 注入用户/团队信息
     return await next({
       ctx: {
         ...ctx,
@@ -110,7 +107,8 @@ export const authenticatedMiddleware = t.middleware(async ({ ctx, next, path, me
     });
   }
 
-  // 非 API V2 请求: 走 Session 认证路径
+  // 分支 2: 无 Authorization 头 或 不是 API V2 请求
+  // 子场景 A: 无 Authorization 头 → 进入 Session 检查分支
   if (!ctx.session) {
     throw new TRPCError({
       code: 'UNAUTHORIZED',
@@ -159,7 +157,7 @@ const t = initTRPC.meta<TrpcRouteMeta>().context<TrpcContext>().create({
 - ✅ 共享相同的 `getApiTokenByToken()` 验证逻辑
 - ✅ 使用 tRPC 错误格式化器进行状态码映射
 - ✅ 支持 `AppError` 中的自定义 `statusCode` 覆盖映射表
-- ⚠️ token 缺失时抛出 `Error` 而非 `AppError`（可能导致 500）
+- ⚠️ 两条分支处理 token 缺失的方式不同
 - ❌ **缺少 `user.disabled` 检查！已禁用用户可以正常通过认证**
 
 ---
@@ -284,20 +282,89 @@ AppError.statusCode (401)
 
 ## 5. 失败返回对齐对比表（逐条代码验证）
 
-### 5.1 逐条代码核对结果
+### 5.1 tRPC/API V2 Token 缺失双子场景深度分析
+
+#### 子场景 A: 无 Authorization 头
+
+**触发条件**:
+- `authorizationHeader = null` (请求没有 Authorization 头)
+- `isApiV2 = true`
+
+**执行路径**:
+```
+trpc.ts:86
+  if (authorizationHeader && isApiV2)
+  → null && true → false
+  → 跳过 API Token 认证分支
+  ↓
+trpc.ts:127
+  if (!ctx.session)
+  → !null → true
+  ↓
+trpc.ts:128-131
+  throw new TRPCError({
+    code: 'UNAUTHORIZED',
+    message: 'Invalid session or API token.',
+  });
+```
+
+**最终结果**:
+- 抛出 `TRPCError`，code = `UNAUTHORIZED`
+- tRPC 框架映射为 **HTTP 401 Unauthorized**
+
+---
+
+#### 子场景 B: 有 Authorization 头但 token 为空
+
+**触发条件**:
+- `authorizationHeader = "Bearer "` 或 `""` 或其他空值
+- `isApiV2 = true`
+
+**执行路径**:
+```
+trpc.ts:86
+  if (authorizationHeader && isApiV2)
+  → "Bearer " && true → true
+  → 进入 API Token 认证分支
+  ↓
+trpc.ts:88
+  const [token] = (authorizationHeader || '').split('Bearer ').filter((s) => s.length > 0);
+  例: "Bearer " → ["", ""] → filter → [] → token = undefined
+  ↓
+trpc.ts:90-91
+  if (!token) → true
+  throw new Error('Token was not provided for authenticated middleware');
+  ↓
+  抛出普通 Error，不是 AppError 或 TRPCError
+  ↓
+tRPC errorFormatter:
+  originalError instanceof AppError? → false
+  → httpStatus 未被 AppError 逻辑设置
+  → TRPCError code 默认为 INTERNAL_SERVER_ERROR
+```
+
+**最终结果**:
+- 抛出普通 `Error`
+- errorFormatter 不识别
+- 映射为 **HTTP 500 Internal Server Error**
+
+---
+
+### 5.2 逐条代码核对结果（含子场景拆分）
 
 | 错误场景 | API V1 路径 (代码位置) | tRPC/API V2 路径 (代码位置) | 实际返回 | 一致性 |
 |---------|----------------------|---------------------------|---------|--------|
-| **Token 缺失** | `authenticated.ts:57-60` 抛出 `AppError(UNAUTHORIZED)`，catch 块硬编码返回 401 | `trpc.ts:90-91` 抛出 `Error("Token was not provided...")`，Error 不是 AppError，进入 default 分支 | V1: 401<br>tRPC: 可能 500 | ❌ 不一致 |
+| **Token 缺失 (子场景 A: 无 Authorization 头)** | `authenticated.ts:57-60` 抛出 `AppError(UNAUTHORIZED)`，catch 块硬编码返回 401 | `trpc.ts:127-131` 进入 Session 分支，抛出 `TRPCError(UNAUTHORIZED)` | 401 | ✅ 一致 |
+| **Token 缺失 (子场景 B: 有头但 token 为空)** | `authenticated.ts:57-60` 抛出 `AppError(UNAUTHORIZED)`，catch 块硬编码返回 401 | `trpc.ts:90-91` 抛出 `Error("Token was not provided...")`，Error 不是 AppError，进入 default 分支 | V1: 401<br>tRPC: 500 | ❌ 不一致 |
 | **Token 无效** | `getApiTokenByToken.ts:41-46` 抛出 `AppError(UNAUTHORIZED, {statusCode:401})`，V1 catch 块返回 401 | 相同的 `getApiTokenByToken` 抛出，tRPC errorFormatter 识别 `statusCode:401` | 401 | ✅ 一致 |
 | **Token 过期** | `getApiTokenByToken.ts:48-53` 抛出 `AppError(EXPIRED_CODE, {statusCode:401})`，V1 catch 块返回 401 | 相同的 `getApiTokenByToken` 抛出，tRPC errorFormatter 识别 `statusCode:401` | 401 | ✅ 一致 |
 | **用户被禁用** | `authenticated.ts:65-69` 抛出 `AppError(UNAUTHORIZED)`，catch 块返回 401 | `trpc.ts:94-124` **没有检查** `apiToken.user.disabled`，直接进入 next | V1: 401<br>tRPC: 200 ✅ 通过 | ❌ **严重不一致（安全漏洞）** |
 | **无资源权限** | 业务层返回 404 | 业务层返回 404 | 404 | ✅ 一致 |
 | **业务逻辑错误** | 400/404/500 | 400/404/500 | 相同 | ✅ 一致 |
 
-### 5.2 关键不一致点深度分析
+### 5.3 关键不一致点深度分析
 
-**问题 1: Token 缺失时的错误类型不一致**
+**问题 1: 子场景 B - token 为空时抛出 Error 而非 TRPCError/AppError**
 
 ```typescript
 // API V1 路径: authenticated.ts:57-60
@@ -306,8 +373,8 @@ throw new AppError(AppErrorCode.UNAUTHORIZED, { message: 'API token was not prov
 
 // tRPC 路径: trpc.ts:90-91
 throw new Error('Token was not provided for authenticated middleware');
-// error.cause 是 Error 而非 AppError → errorFormatter 不识别 → httpStatus 未设置
-// → 可能返回 INTERNAL_SERVER_ERROR (500)
+// error.cause 是 Error 而非 AppError/TRPCError → errorFormatter 不识别
+// → 返回 INTERNAL_SERVER_ERROR (500)
 ```
 
 **问题 2: tRPC 路径缺少 user.disabled 检查 - 安全漏洞！**
@@ -371,12 +438,16 @@ createOpenApiFetchHandler 处理
   ↓
 authenticatedMiddleware 拦截
   ↓
-┌─────────────────────────────────────────┐
-│  1. 提取 token                          │
-│  2. 验证 token (getApiTokenByToken)    │
-│     └─ 失败 → 抛出 AppError             │
-│  3. ❌ 缺少 user.disabled 检查          │
-└─────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  有 Authorization 头?                                  │
+│  ├─ 是 → 子场景 B: 提取 token → 验证                  │
+│  │     ├─ token 空 → 抛出 Error → 500                 │
+│  │     ├─ token 无效/过期 → 抛出 AppError → 401       │
+│  │     └─ ❌ 缺少 user.disabled 检查                   │
+│  └─ 否 → 子场景 A: 进入 Session 分支                  │
+│        └─ session 空 → 抛出 TRPCError(UNAUTHORIZED)   │
+│           → 401                                       │
+└───────────────────────────────────────────────────────┘
   ↓
 tRPC errorFormatter 处理错误
   ↓
@@ -386,7 +457,9 @@ tRPC errorFormatter 处理错误
 │     ├─ 是 → 使用 appError.statusCode ?? │
 │     │        mappedStatus ?? 400        │
 │     └─ 否 → TRPCError 或普通 Error      │
-│          → 可能返回 500                 │
+│          → TRPCError code 映射 HTTP 状态码
+│          → UNAUTHORIZED → 401
+│          → 其他 → 默认可能 500          │
 └─────────────────────────────────────────┘
   ↓
 返回最终 HTTP 响应
@@ -445,7 +518,7 @@ const { envelopeWhereInput } = await getEnvelopeWhereInput({
 | 问题 | 影响 | 严重程度 | 代码位置 |
 |-----|------|---------|---------|
 | tRPC 路径缺少 `user.disabled` 检查 | 已禁用用户仍可通过 API Token 访问 | **高** | `packages/trpc/server/trpc.ts:94-124` |
-| tRPC 路径 token 缺失时抛出 `Error` 而非 `AppError` | 可能返回 500 而非 401 | 中 | `packages/trpc/server/trpc.ts:90-91` |
+| tRPC 路径 token 为空时抛出 `Error` 而非 `TRPCError`/`AppError` | 返回 500 而非 401 | 中 | `packages/trpc/server/trpc.ts:90-91` |
 | API V1 中间件忽略 `AppError.statusCode`，统一返回 401 | 过期 token 无法通过状态码区分 | 低 | `packages/api/v1/middleware/authenticated.ts:108-113` |
 | `toRestAPIError()` 未处理 `EXPIRED_CODE`，返回 500 | 业务层直接调用时可能返回错误状态码 | 中 | `packages/lib/errors/app-error.ts:228-256` |
 
@@ -467,15 +540,15 @@ if (apiToken.user.disabled) {
 ctx.logger.info({ ... });
 ```
 
-**建议 2: 统一 tRPC 中间件的错误抛出类型**
+**建议 2: 统一 tRPC 中间件的错误抛出类型 - 使用 TRPCError**
 ```typescript
 // 修改前 (第90-91行)
 throw new Error('Token was not provided for authenticated middleware');
 
-// 修改后
-throw new AppError(AppErrorCode.UNAUTHORIZED, {
-  message: 'API token was not provided',
-  statusCode: 401,
+// 修改后 (与 Session 分支保持一致)
+throw new TRPCError({
+  code: 'UNAUTHORIZED',
+  message: 'API token was not provided.',
 });
 ```
 
@@ -502,10 +575,11 @@ const status = match(error.code)
 | **过期令牌状态码** | 401 (硬编码) | 401 (显式设置 statusCode) |
 | **错误处理** | try-catch 硬编码 | tRPC errorFormatter 映射 |
 | **statusCode 优先级** | 忽略，强制 401 | 自定义 > 映射表 > 默认 |
-| **Token 缺失返回** | 401 UNAUTHORIZED | ❓ 可能 500 Error |
+| **Token 缺失 (无 Authorization 头)** | 401 UNAUTHORIZED | 401 UNAUTHORIZED |
+| **Token 缺失 (有头但 token 为空)** | 401 UNAUTHORIZED | ❌ 500 Internal Server Error |
 | **安全策略** | 无权限返回 404 | 无权限返回 404 |
 | **代码复用** | 独立实现 | 部分复用（注释说明取自 V1） |
 
-**总体一致性**: ⚠️ **存在关键不一致** - 核心验证逻辑共享，但缺少 `user.disabled` 检查可能导致**禁用用户绕过认证**。建议优先修复此安全漏洞。
+**总体一致性**: ⚠️ **存在关键不一致** - 核心验证逻辑共享，但缺少 `user.disabled` 检查可能导致**禁用用户绕过认证**，且 token 为空的子场景返回 500 而非 401。建议优先修复这两个问题。
 
-**最终核对结论**: tRPC/API V2 路径 **没有** `user.disabled` 拦截逻辑，这是两条路径最大的差异，也是一个安全隐患。
+**最终核对结论**: tRPC/API V2 路径 **没有** `user.disabled` 拦截逻辑，且 token 缺失时有两条不同的执行路径，这是两条路径最大的差异，也是安全隐患。

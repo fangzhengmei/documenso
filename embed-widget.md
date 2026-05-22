@@ -725,14 +725,16 @@ const hidePoweredBy = organisationClaim.flags.hidePoweredBy;
 | 可执行操作 | 签署文档、查看内容 | 编辑文档、创建模板 |
 | 签名验证 | 数据库查询 | JWT 签名验证 |
 
-### 5.6 路由访问控制
+### 5.6 路由访问控制（签署主链路）
 
-嵌入式路由通过多层防护确保安全：
+嵌入式签署路由通过多层防护确保安全：
 
-1. **Loader 层 Token 验证**：每次页面加载验证预签名 Token
-2. **Layout 层权限声明**：获取组织功能权限声明
-3. **TRPC 中间件验证**：每个 API 调用再次验证 Token
+1. **Loader 层 Token 验证**：每次页面加载通过数据库查询验证 `recipient.token`（不是预签名 Token）
+2. **Layout 层权限声明**：获取组织功能权限声明（`embedSigning`、`embedSigningWhiteLabel` 等）
+3. **TRPC API 层验证**：签署操作 API 再次通过 Token 验证收件人权限
 4. **Context 层环境标记**：通过 React Context 标记嵌入环境
+
+**⚠️ 注意**："预签名 Token 验证"和"TRPC 中间件验证"属于创作嵌入链路（`/embed/v1/v2/authoring/...`），签署主链路不使用预签名 Token。
 
 ---
 
@@ -1019,51 +1021,120 @@ useLayoutEffect(() => {
 **⚠️ 重要澄清**：签署主链路使用 `recipient.token`，这是一个**随机字符串**（非 JWT），**没有签名、没有过期时间**（JWT 的 exp/iat 等概念完全不适用）。Token 的有效性通过数据库查询验证，而非密码学签名验证。
 
 **触发条件**（主链路 `/embed/sign/{token}` Loader 层）：
-- Token 格式错误（空值、长度不符）
-- Token 对应的收件人不存在（数据库查询返回 null）
-- **注意**：没有"签名无效"、"Token 过期"、"Audience 不匹配"等 JWT 语义，这些属于创作链路的预签名 Token
+- URL 参数 token 为空（`!params.token`）
+- Token 对应的文档不存在（`getDocumentAndSenderByToken` 返回 null）
+- Token 对应的收件人不存在（`getRecipientByToken` 返回 null）
+- **⚠️ 注意**：真实源码中**没有**"长度不符"检查，只有空值检查
+- **⚠️ 注意**：真实源码中**没有**"签名无效"、"Token 过期"、"Audience 不匹配"等 JWT 语义，这些属于创作链路的预签名 Token
 
-**代码锚点**：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:45-60`
+**代码锚点（V1 Loader）**：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:34-60`
 
 ```typescript
 // V1 Loader 验证 - 主链路（无 JWT 签名验证）
-const [document, fields, recipient, completedFields] = await Promise.all([
-  getDocumentAndSenderByToken({
-    token,           // recipient.token - 随机字符串
-    userId: user?.id,
-    requireAccessAuth: false,
-  }).catch(() => null),  // ❌ 查询失败返回 null
-  getFieldsForToken({ token }).catch(() => []),
-  getRecipientByToken({ token }).catch(() => null),  // ❌ 查询失败返回 null
-  getCompletedFieldsForToken({ token }).catch(() => []),
-]);
+async function handleV1Loader({ params, request }: Route.LoaderArgs) {
+  // ✅ L1: 检查 URL 参数 token 是否为空
+  if (!params.token) {
+    throw new Response('Not found', { status: 404 });
+  }
 
-if (!document || !recipient) {
-  throw new Response('Not found', { status: 404 });  // ❌ 完全拒绝
+  const token = params.token;
+  const { user } = await getOptionalSession(request);
+
+  // ✅ L2: 并行查询（注意：只有 getFieldsForToken 没有 catch！）
+  const [document, fields, recipient, completedFields] = await Promise.all([
+    getDocumentAndSenderByToken({
+      token,
+      userId: user?.id,
+      requireAccessAuth: false,
+    }).catch(() => null),  // ✅ 有 catch → 返回 null
+    getFieldsForToken({ token }),  // ❌ 没有 catch！内部 recipient 不存在时返回 []
+    getRecipientByToken({ token }).catch(() => null),  // ✅ 有 catch → 返回 null
+    getCompletedFieldsForToken({ token }).catch(() => []),  // ✅ 有 catch → 返回 []
+  ]);
+
+  // ✅ L3: 验证 document 和 recipient 是否存在（fields 不检查！）
+  if (!document || !recipient) {
+    throw new Response('Not found', { status: 404 });
+  }
+  // ...
 }
 ```
 
-**核心验证函数**：`getRecipientByToken`（`packages/lib/server-only/recipient/get-recipient-by-token.ts:1`）
+**核心验证函数对比**：
+
+| 函数 | 内部行为 | 失败时处理 | 代码锚点 |
+|-----|---------|-----------|---------|
+| `getDocumentAndSenderByToken` | 查 envelope（type=DOCUMENT）+ recipient（token 匹配） | 外面 catch → 返回 null | `get-document-by-token.ts:38-51` |
+| `getFieldsForToken` | 查 recipient → 查 fields | recipient 不存在 → return `[]`（不抛错） | `get-fields-for-token.ts:8-63` |
+| `getRecipientByToken` | `findFirstOrThrow` 查 recipient | 外面 catch → 返回 null | `get-recipient-by-token.ts:7-16` |
+| `getCompletedFieldsForToken` | 查 completed fields | 外面 catch → 返回 `[]` | （文档未展示） |
+
+**getFieldsForToken 内部行为（无 throw）**：
 
 ```typescript
-// 仅通过数据库查询验证 token，无签名、无过期检查
-export const getRecipientByToken = async ({ token }: { token: string }) => {
-  return await prisma.recipient.findFirstOrThrow({
-    where: { token },  // ✅ 仅通过 token 字段查找
-  });
+// packages/lib/server-only/field/get-fields-for-token.ts:8-20
+export const getFieldsForToken = async ({ token }: GetFieldsForTokenOptions) => {
+  if (!token) {
+    throw new Error('Missing token');  // ✅ 仅空值检查，无长度检查
+  }
+
+  const recipient = await prisma.recipient.findFirst({ where: { token } });
+
+  if (!recipient) {
+    return [];  // ⚠️ 不抛错！返回空数组
+  }
+  // ... 查询 fields
 };
 ```
 
-**权限收敛策略**（主链路）：
+**⚠️ 关键修正**：`getFieldsForToken` 调用**没有** `.catch(() => [])`，因为该函数内部在 recipient 不存在时直接返回 `[]`，不会抛出错误（除非 token 为空）。
 
-| 验证阶段 | 失败处理 | 权限收敛结果 | 代码锚点 |
-|---------|---------|-------------|---------|
-| Token 存在性检查 | 抛出 404 响应 | ❌ 完全拒绝访问 | `sign.$token.tsx:37-39` |
-| 收件人存在性检查 | 抛出 404 响应 | ❌ 完全拒绝访问 | `sign.$token.tsx:58-60` |
-| Token 过期检查 | （无，使用 recipient.expiredAt 字段） | 见场景 4 | `sign.$token.tsx:81-90` |
-| **JWT 签名验证** | ❌ 不存在此概念 | - | - |
-| **Audience 匹配** | ❌ 不存在此概念 | - | - |
-| **Scope 匹配** | ❌ 不存在此概念 | - | - |
+**权限收敛策略（主链路 V1）**：
+
+| 验证阶段 | 真实源码检查 | 失败处理 | 权限收敛结果 | 代码锚点 |
+|---------|-------------|---------|-------------|---------|
+| L1 URL token 空值 | `!params.token` | 抛出 404 | ❌ 完全拒绝 | `sign.$token.tsx:37-39` |
+| L2 document 存在性 | `getDocumentAndSenderByToken` + catch | 返回 null | 见 L3 | `sign.$token.tsx:46-50` |
+| L2 recipient 存在性 | `getRecipientByToken` + catch | 返回 null | 见 L3 | `sign.$token.tsx:52` |
+| L3 联合检查 | `!document \|\| !recipient` | 抛出 404 | ❌ 完全拒绝 | `sign.$token.tsx:58-60` |
+| **Token 长度检查** | ❌ 不存在此检查 | - | - | - |
+| **JWT 签名验证** | ❌ 不存在此概念 | - | - | - |
+| **Audience 匹配** | ❌ 不存在此概念 | - | - | - |
+| **Scope 匹配** | ❌ 不存在此概念 | - | - | - |
+
+**权限收敛策略（主链路 V2，不同流程）**：
+
+V2 使用 `getEnvelopeForRecipientSigning` 统一查询，流程完全不同：
+
+```typescript
+// apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:155-189
+async function handleV2Loader({ params, request }: Route.LoaderArgs) {
+  if (!params.token) {
+    throw new Response('Not found', { status: 404 });
+  }
+
+  const token = params.token;
+  const { user } = await getOptionalSession(request);
+
+  // ✅ V2 用单一函数统一查询，包含 catch 分支
+  const envelopeForSigning = await getEnvelopeForRecipientSigning({
+    token,
+    userId: user?.id,
+  })
+    .then((envelopeForSigning) => {
+      return { isDocumentAccessValid: true, ...envelopeForSigning };
+    })
+    .catch(async (e) => {
+      const error = AppError.parseError(e);
+      if (error.code === AppErrorCode.UNAUTHORIZED) {
+        const requiredAccessData = await getEnvelopeRequiredAccessData({ token });
+        return { isDocumentAccessValid: false, ...requiredAccessData };
+      }
+      throw new Response('Not Found', { status: 404 });  // ❌ 其他错误 → 404
+    });
+  // ...
+}
+```
 
 ---
 
@@ -1160,20 +1231,18 @@ export function ErrorBoundary() {
 
 #### 场景 3：组织功能权限不足（签署主链路）
 
-**触发条件**（主链路 `/embed/sign/{token}` Loader 层）：
+**触发条件**（主链路 `/embed/sign/{token}` Loader 层，V1/V2 相同）：
 - 组织未开通嵌入式签署功能（`organisationClaim.flags.embedSigning = false`）
-- 账单状态异常
+- `IS_BILLING_ENABLED()` 为 true（开启计费）
 
-**⚠️ 注意**：这是主链路唯一的"预签发"检查，在 token 验证通过后、页面渲染前执行。
+**⚠️ 注意**：这是 token 验证通过后的检查，在所有 token 验证成功后才执行。
 
 **代码锚点**：
 - V1：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:70-79`
 - V2：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:211-220`
 
 ```typescript
-// V1 Loader - 组织权限检查
-const organisationClaim = await getOrganisationClaimByTeamId({ teamId: document.teamId });
-
+// V1 和 V2 代码完全相同
 if (IS_BILLING_ENABLED() && !organisationClaim.flags.embedSigning) {
   throw data(
     { type: 'embed-paywall' },
@@ -1195,47 +1264,97 @@ if (IS_BILLING_ENABLED() && !organisationClaim.flags.embedSigning) {
 #### 场景 4：收件人状态异常（签署主链路）
 
 **触发条件**（主链路 `/embed/sign/{token}` Loader 层）：
-- 收件人已完成签署（`signingStatus = SIGNED`）
-- 收件人已拒绝签署（`signingStatus = REJECTED`）
-- 收件人已过期（`recipient.expiredAt < now`）
-- 尚未轮到该收件人签署（顺序签署模式）
+- 收件人已过期（V1: `isRecipientExpired(recipient)`，V2: `isExpired`）
+- 不是签署轮次（V1: `!isRecipientsTurnToSign`，V2: `!isRecipientsTurn`）
 - 需要 Access Auth 认证（ACCOUNT / 2FA）
 
-**⚠️ 重要澄清**："Token 过期"概念不适用于 `recipient.token`，实际检查的是 `recipient.expiredAt` 字段（收件人级别过期时间），而非 Token 本身的过期时间。
+**⚠️ 重要澄清**：
+- "Token 过期"概念不适用于 `recipient.token`，实际检查的是 `recipient.expiredAt` 字段（收件人级别过期时间），而非 Token 本身的过期时间。
+- V1 和 V2 的校验顺序**不同**：
+  - V1：过期检查 → Access Auth 检查 → 轮次检查
+  - V2：过期检查 → 轮次检查 → Access Auth 检查
 
-**代码锚点**：
-- 过期检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:81-90`（V1）、`222-231`（V2）
-- 轮次检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:116-127`（V1）、`233-242`（V2）
-- Access Auth 检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:92-114`（V1）、`244-267`（V2）
+**代码锚点（V1 校验顺序）**：
+- 过期检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:81-90`
+- Access Auth 检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:92-114`
+- 轮次检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:116-127`
 
 ```typescript
-// 检查收件人是否过期（检查 recipient.expiredAt，不是 token 过期）
+// V1 校验顺序
 if (isRecipientExpired(recipient)) {
+  throw data({ type: 'embed-recipient-expired' }, { status: 403 });
+}
+
+const { derivedRecipientAccessAuth } = extractDocumentAuthMethods({
+  documentAuth: document.authOptions,
+});
+
+const isAccessAuthValid = derivedRecipientAccessAuth.every((accesssAuth) =>
+  match(accesssAuth)
+    .with(DocumentAccessAuth.ACCOUNT, () => user && user.email === recipient.email)
+    .with(DocumentAccessAuth.TWO_FACTOR_AUTH, () => true)
+    .exhaustive(),
+);
+
+if (!isAccessAuthValid) {
   throw data(
-    { type: 'embed-recipient-expired' },
-    { status: 403 },
+    { type: 'embed-authentication-required', email: user?.email || recipient.email, returnTo: `/embed/sign/${token}` },
+    { status: 401 },
   );
 }
 
-// 检查是否是签署轮次
 const isRecipientsTurnToSign = await getIsRecipientsTurnToSign({ token });
 if (!isRecipientsTurnToSign) {
+  throw data({ type: 'embed-waiting-for-turn' }, { status: 403 });
+}
+```
+
+**代码锚点（V2 校验顺序，isExpired 和 isRecipientsTurn 来自 envelopeForSigning）**：
+- 过期检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:222-231`
+- 轮次检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:233-242`
+- Access Auth 检查：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:244-267`
+
+```typescript
+// V2 校验顺序（isExpired 和 isRecipientsTurn 来自 getEnvelopeForRecipientSigning）
+const { envelope, recipient, isRecipientsTurn, isExpired } = envelopeForSigning;
+
+if (isExpired) {
+  throw data({ type: 'embed-recipient-expired' }, { status: 403 });
+}
+
+if (!isRecipientsTurn) {
+  throw data({ type: 'embed-waiting-for-turn' }, { status: 403 });
+}
+
+const { derivedRecipientAccessAuth } = extractDocumentAuthMethods({
+  documentAuth: envelope.authOptions,
+  recipientAuth: recipient.authOptions,
+});
+
+const isAccessAuthValid = derivedRecipientAccessAuth.every((accesssAuth) =>
+  match(accesssAuth)
+    .with(DocumentAccessAuth.ACCOUNT, () => user && user.email === recipient.email)
+    .with(DocumentAccessAuth.TWO_FACTOR_AUTH, () => true)
+    .exhaustive(),
+);
+
+if (!isAccessAuthValid) {
   throw data(
-    { type: 'embed-waiting-for-turn' },
-    { status: 403 },
+    { type: 'embed-authentication-required', email: user?.email || recipient.email, returnTo: `/embed/sign/${token}` },
+    { status: 401 },
   );
 }
 ```
 
-**权限收敛策略**：
+**权限收敛策略（V1 和 V2 相同，仅顺序不同）**：
 
-| 收件人状态 | 处理方式 | 权限收敛结果 | 代码锚点 |
-|-----------|---------|-------------|---------|
-| 已签署 | Loader 中重定向到 `/complete` 或直接返回已完成状态 | ✅ 渲染完成页面，不允许重复签署 | `sign.$token.tsx:84-86` |
-| 已拒绝 | Loader 中重定向到 `/rejected` | ✅ 渲染拒绝页面，不允许更改 | `sign.$token.tsx:84-86` |
-| 已过期 | throw 403 `embed-recipient-expired` | ✅ 渲染过期页面，不允许签署 | `sign.$token.tsx:81-90` |
-| 等待轮次 | throw 403 `embed-waiting-for-turn` | ✅ 渲染等待页面，不允许签署 | `sign.$token.tsx:116-127` |
-| 需要 Access Auth | throw 401 `embed-authentication-required` | ✅ 渲染认证页面，要求登录/2FA | `sign.$token.tsx:92-114` |
+| 收件人状态 | 处理方式 | 权限收敛结果 | 代码锚点（V1） | 代码锚点（V2） |
+|-----------|---------|-------------|--------------|--------------|
+| 已签署 | Loader 中重定向或直接返回已完成状态 | ✅ 渲染完成页面，不允许重复签署 | `sign.$token.tsx:84-86` | `getEnvelopeForRecipientSigning` |
+| 已拒绝 | Loader 中重定向或直接返回已拒绝状态 | ✅ 渲染拒绝页面，不允许更改 | `sign.$token.tsx:84-86` | `getEnvelopeForRecipientSigning` |
+| 已过期 | throw 403 `embed-recipient-expired` | ✅ 渲染过期页面，不允许签署 | `sign.$token.tsx:81-90` | `sign.$token.tsx:222-231` |
+| 等待轮次 | throw 403 `embed-waiting-for-turn` | ✅ 渲染等待页面，不允许签署 | `sign.$token.tsx:116-127` | `sign.$token.tsx:233-242` |
+| 需要 Access Auth | throw 401 `embed-authentication-required` | ✅ 渲染认证页面，要求登录/2FA | `sign.$token.tsx:92-114` | `sign.$token.tsx:244-267` |
 
 **生命周期事件收敛**（状态页面）：
 
@@ -1263,62 +1382,109 @@ useEffect(() => {
 
 ### 6.4 /embed/sign 主链路状态分流与事件收敛图
 
-**主链路状态分流图**（基于 `apps/remix/app/routes/embed+/_v0+/sign.$token.tsx` 实际代码）：
+**主链路 V1 状态分流图**（基于 `apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:34-140` 真实源码）：
 
 ```
-/embed/sign/{token}
+/embed/sign/{token}  (V1)
     │
-    ├─► Token 无效（数据库查不到）──────────► 404 Not Found
-    │    (getRecipientByToken 返回 null)          │
-    │                                             └─► ❌ 无事件
+    ├─► L1: !params.token ──────────────────────► 404 Not Found
+    │    (URL 参数为空)                                │
+    │                                                  └─► ❌ 无事件
     │
-    ├─► 组织无嵌入权限 ───────────────────────► 403 embed-paywall
-    │    (!organisationClaim.flags.embedSigning)    │
-    │                                             └─► ❌ 无事件
+    ├─► L2: Promise.all 并行查询
+    │    ├─► getDocumentAndSenderByToken().catch(() => null)
+    │    ├─► getFieldsForToken({ token })        ⚠️ 无 catch！内部返回 []
+    │    ├─► getRecipientByToken().catch(() => null)
+    │    └─► getCompletedFieldsForToken().catch(() => [])
     │
-    ├─► 收件人已过期 ──────────────────────────► 403 embed-recipient-expired
-    │    (recipient.expiredAt < now)               │
-    │                                             └─► ✅ 发送 recipient-expired
+    ├─► L3: !document || !recipient ───────────► 404 Not Found
+    │                                                  └─► ❌ 无事件
     │
-    ├─► 不是签署轮次 ──────────────────────────► 403 embed-waiting-for-turn
-    │    (!isRecipientsTurnToSign)                 │
-    │                                             └─► ✅ 发送 document-waiting-for-turn
+    ├─► L4: 组织无嵌入权限 ─────────────────────► 403 embed-paywall
+    │    (!organisationClaim.flags.embedSigning)        │
+    │                                                  └─► ❌ 无事件
     │
-    ├─► 需要 Access Auth ─────────────────────► 401 embed-authentication-required
-    │    (!isAccessAuthValid)                     │
-    │                                             └─► ❌ 无事件（要求登录/2FA）
+    ├─► L5: isRecipientExpired(recipient) ──────► 403 embed-recipient-expired
+    │                                                  └─► ✅ 发送 recipient-expired
     │
-    └─► 全部验证通过 ───────────────────────────► 渲染签署页面（V1/V2）
+    ├─► L6: !isAccessAuthValid ─────────────────► 401 embed-authentication-required
+    │                                                  └─► ❌ 无事件（要求登录/2FA）
+    │
+    ├─► L7: !isRecipientsTurnToSign ───────────► 403 embed-waiting-for-turn
+    │                                                  └─► ✅ 发送 document-waiting-for-turn
+    │
+    └─► 全部验证通过 ────────────────────────────► 渲染签署页面（V1）
          │
          ├─► Hash 解析成功 ─────────────────────► ✅ document-ready（完整权限）
          │
-         └─► Hash 解析失败 ─────────────────────► V1: 取决于 PDF 是否加载
-                                                    V2: ✅ document-ready（保守权限）
+         └─► Hash 解析失败 ─────────────────────► 取决于 PDF 是否加载
+                                                    PDF 加载成功 → ✅ document-ready（默认配置）
+                                                    PDF 加载失败 → ❌ 不发送
 ```
 
-**⚠️ 重要说明**：
+**主链路 V2 状态分流图**（基于 `apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:155-267` 真实源码）：
+
+```
+/embed/sign/{token}  (V2)
+    │
+    ├─► L1: !params.token ──────────────────────► 404 Not Found
+    │    (URL 参数为空)                                │
+    │                                                  └─► ❌ 无事件
+    │
+    ├─► L2: getEnvelopeForRecipientSigning()
+    │    ├─► 成功 → { isDocumentAccessValid: true, envelope, recipient, isRecipientsTurn, isExpired }
+    │    └─► 失败（UNAUTHORIZED）→ { isDocumentAccessValid: false, ... }
+    │    └─► 失败（其他）→ 404 Not Found
+    │
+    ├─► L3: !isDocumentAccessValid ────────────► 401 embed-authentication-required
+    │                                                  └─► ❌ 无事件
+    │
+    ├─► L4: 组织无嵌入权限 ─────────────────────► 403 embed-paywall
+    │                                                  └─► ❌ 无事件
+    │
+    ├─► L5: isExpired ─────────────────────────► 403 embed-recipient-expired
+    │                                                  └─► ✅ 发送 recipient-expired
+    │
+    ├─► L6: !isRecipientsTurn ──────────────────► 403 embed-waiting-for-turn
+    │                                                  └─► ✅ 发送 document-waiting-for-turn
+    │
+    ├─► L7: !isAccessAuthValid ─────────────────► 401 embed-authentication-required
+    │                                                  └─► ❌ 无事件
+    │
+    └─► 全部验证通过 ────────────────────────────► 渲染签署页面（V2）
+         │
+         ├─► Hash 解析成功 ─────────────────────► ✅ document-ready（完整权限）
+         │
+         └─► Hash 解析失败 ─────────────────────► ✅ document-ready（默认配置，不等待 PDF）
+```
+
+**⚠️ 重要说明（V1/V2 共同）**：
 - 没有"Token 签名无效"检查（因为 recipient.token 是随机字符串，不是 JWT）
 - 没有"Audience 不匹配"检查（没有 JWT aud claim 概念）
 - 没有"Token 过期"检查（用 recipient.expiredAt 字段代替）
 - 没有"Scope 不匹配"检查（没有 JWT scope 概念）
+- 没有"Token 长度不符"检查（只有空值检查）
 
 ---
 
-### 6.5 握手失败的事件收敛总结
+### 6.5 握手失败的事件收敛总结（V1/V2 统一）
 
-| 失败场景 | document-ready | 其他事件 | 权限收敛结果 | 代码锚点 |
-|---------|---------------|---------|-------------|---------|
-| Token 无效/不存在 | ❌ 不发送 | ❌ 不发送 | 完全拒绝访问 | `sign.$token.tsx:58-60` |
-| 组织权限不足 | ❌ 不发送 | ❌ 不发送 | 完全拒绝访问 | `sign.$token.tsx:70-79` |
-| 收件人已过期 | ❌ 不发送 | ✅ recipient-expired | 禁止签署 | `sign.$token.tsx:81-90` |
-| 等待签署轮次 | ❌ 不发送 | ✅ document-waiting-for-turn | 禁止签署 | `sign.$token.tsx:116-127` |
-| 需要 Access Auth | ❌ 不发送 | ❌ 不发送 | 要求认证 | `sign.$token.tsx:92-114` |
-| Hash 解析失败（V1） | ❌ 可能不发（取决于 PDF） | ✅ 后续签署事件仍可发送 | 保守权限（默认配置） | `v1.tsx:192-252` |
-| Hash 解析失败（V2） | ✅ 发送 | ✅ 后续签署事件仍可发送 | 保守权限（默认配置） | `v2.tsx:124-186` |
+| 失败场景 | document-ready | 其他事件 | 权限收敛结果 | 代码锚点（V1） | 代码锚点（V2） |
+|---------|---------------|---------|-------------|--------------|--------------|
+| L1 URL token 为空 | ❌ 不发送 | ❌ 不发送 | 完全拒绝访问 | `sign.$token.tsx:37-39` | `sign.$token.tsx:158-160` |
+| L2/L3 document/recipient 不存在 | ❌ 不发送 | ❌ 不发送 | 完全拒绝访问 | `sign.$token.tsx:58-60` | `sign.$token.tsx:188` |
+| L4 组织权限不足 | ❌ 不发送 | ❌ 不发送 | 完全拒绝访问 | `sign.$token.tsx:70-79` | `sign.$token.tsx:211-220` |
+| L5 收件人已过期 | ❌ 不发送 | ✅ recipient-expired | 禁止签署 | `sign.$token.tsx:81-90` | `sign.$token.tsx:222-231` |
+| L6 (V1)/L7 (V2) Access Auth | ❌ 不发送 | ❌ 不发送 | 要求认证 | `sign.$token.tsx:92-114` | `sign.$token.tsx:244-267` |
+| L7 (V1)/L6 (V2) 等待签署轮次 | ❌ 不发送 | ✅ document-waiting-for-turn | 禁止签署 | `sign.$token.tsx:116-127` | `sign.$token.tsx:233-242` |
+| Hash 解析失败（V1） | ❌ 可能不发（取决于 PDF） | ✅ 后续签署事件仍可发送 | 保守权限（默认配置） | `v1.tsx:192-252` | - |
+| Hash 解析失败（V2） | ✅ 发送 | ✅ 后续签署事件仍可发送 | 保守权限（默认配置） | - | `v2.tsx:124-186` |
 
-> **统一结论**：`document-ready` 不发送不代表签署流程不可用，宿主端应通过多种信号组合判断状态。
->
-> **关键区分**：签署主链路（`/embed/sign/{token}`）使用 `recipient.token`（随机字符串，无 JWT 语义）；创作链路（`/embed/v1/v2/authoring/...`）使用预签名 Token（JWT，有签名/过期/audience/scope）。
+> **统一结论**：
+> 1. `document-ready` 不发送不代表签署流程不可用，宿主端应通过多种信号组合判断状态
+> 2. V1 和 V2 的校验顺序不同：V1 先检查 Access Auth 再检查轮次；V2 先检查轮次再检查 Access Auth
+> 3. V1 的 `getFieldsForToken` 调用没有 `.catch()`，因为该函数内部在 recipient 不存在时直接返回 `[]`
+> 4. **关键区分**：签署主链路（`/embed/sign/{token}`）使用 `recipient.token`（随机字符串，无 JWT 语义）；创作链路（`/embed/v1/v2/authoring/...`）使用预签名 Token（JWT，有签名/过期/audience/scope）
 
 ---
 

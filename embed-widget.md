@@ -22,39 +22,46 @@ Documenso 嵌入式签署组件采用 **iframe + postMessage** 跨域通信架�
 
 ## 二、初始化握手流程
 
-### 2.1 握手时序图
+### 2.1 主链路说明
+
+嵌入式签署的**主流程**基于 `/embed/sign/{token}` 路由（`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx`），这是生产环境实际使用的签署入口。整个流程不涉及预签名 Token（presign token），而是直接使用 `recipient.token` 作为认证凭证。
+
+**注意**：之前提到的 `/embed/v2/authoring/envelope/create?token=<presign>` 是文档创作嵌入链路，**不是签署主链路**。签署主链路不需要预签名 Token。
+
+### 2.2 握手时序图
 
 ```
-宿主页面                          Documenso API                          嵌入式组件
+宿主页面                          Documenso 后端                       嵌入式组件
     │                                   │                                   │
-    │ 1. 请求预签名令牌                  │                                   │
-    │ POST /api/v2/embedding/create-presign-token                         │
+    │ 1. 业务系统创建签署文档（后端到后端）│                                   │
+    │ POST /api/v1/documents             │                                   │
     │ Header: Authorization: Bearer api_xxx │                                   │
     │──────────────────────────────────>│                                   │
-    │                                   │ 2. 验证 API Token                │
-    │                                   │ 3. 生成 JWT 预签名令牌            │
-    │                                   │    (HS256, 有效期默认1小时)       │
+    │                                   │ 2. 创建文档和收件人                │
+    │                                   │ 3. 生成 recipient.token            │
     │ <──────────────────────────────────│                                   │
-    │ 4. 返回 { token, expiresAt }      │                                   │
+    │ 4. 返回 { signUrl: "/embed/sign/{token}", ... }                      │
     │                                                                       │
-    │ 5. 构建 iframe URL                │                                   │
-    │    /embed/v2/authoring/envelope/create?token=<presign>#<hash>         │
+    │ 5. 构建 iframe URL                                                  │
+    │    https://documenso.example.com/embed/sign/{token}#<hash>           │
     │                                   │                                   │
     │ 6. 创建 iframe 加载签署页面        │                                   │
     │──────────────────────────────────────────────────────────────────────>│
-    │                                   │ 7. 服务端 Loader 验证令牌         │
-    │                                   │    verifyEmbeddingPresignToken    │
+    │                                   │ 7. Loader 层验证 token            │
+    │                                   │    getRecipientByToken(token)     │
     │                                   │ <──────────────────────────────────│
-    │                                   │ 8. 返回用户上下文 + 团队配置       │
+    │                                   │ 8. 验证组织权限、收件人状态       │
+    │                                   │    organisationClaim, isExpired,  │
+    │                                   │    isRecipientsTurn, accessAuth   │
     │                                   │──────────────────────────────────>│
     │                                   │                                   │ 9. 解析 URL Hash 配置
-    │                                   │                                   │    (Base64(JSON))
+    │                                   │                                   │    (Base64(encodeURIComponent(JSON)))
     │                                   │                                   │ 10. 发送 document-ready 事件
     │ <──────────────────────────────────────────────────────────────────────│
     │ 11. 握手完成，进入签署流程          │                                   │
 ```
 
-### 2.2 URL Hash 配置协议
+### 2.3 URL Hash 配置协议
 
 嵌入式组件通过 URL Hash 传递非敏感配置参数，采用 `Base64(encodeURIComponent(JSON))` 编码格式。
 
@@ -125,16 +132,57 @@ const hash = btoa(encodeURIComponent(JSON.stringify(hashData)));
 
 ## 三、权限传递机制
 
-### 3.1 双令牌体系
+### 3.1 双链路令牌体系
 
-系统采用 **API Token + 预签名 Token** 双令牌机制，实现权限的安全传递和最小化暴露。
+系统存在两条独立的嵌入链路，使用不同的令牌体系：
 
-| 令牌类型 | 用途 | 有效期 | 存储位置 | 安全性 |
-|---------|------|--------|----------|--------|
-| API Token | 宿主后端调用 Documenso API | 长期 | 宿主后端数据库 | 高，永不暴露给前端 |
-| 预签名 Token | 前端 iframe 认证 | 5分钟~24小时 | URL 查询参数 | 中，短期有效，绑定用户/团队 |
+| 链路类型 | 路由模式 | 令牌类型 | 用途 |
+|---------|---------|---------|------|
+| **签署主链路** | `/embed/sign/{token}` | `recipient.token` | 收件人签署文档 |
+| **创作嵌入链路** | `/embed/v1/v2/authoring/...` | 预签名 Token（JWT） | 文档/模板编辑 |
 
-### 3.2 预签名令牌生成
+**⚠️ 关键区分**：本分析聚焦于**签署主链路**，使用 `recipient.token`，而非预签名 Token。
+
+### 3.2 签署主链路：recipient.token
+
+`recipient.token` 是收件人级别的认证凭证，在创建收件人生成，与特定文档和收件人绑定。
+
+**令牌生成**（创建收件人时自动生成）：
+- 随机字符串（非 JWT）
+- 全局唯一
+- 与 `recipient.id` 一一对应
+- 永久有效（直到文档完成或过期）
+
+**令牌验证**（`/embed/sign/{token}` Loader 层）：
+
+```typescript
+// apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:45-54
+const [document, fields, recipient, completedFields] = await Promise.all([
+  getDocumentAndSenderByToken({
+    token,           // recipient.token
+    userId: user?.id,
+    requireAccessAuth: false,
+  }).catch(() => null),
+  getFieldsForToken({ token }),
+  getRecipientByToken({ token }).catch(() => null),
+  getCompletedFieldsForToken({ token }).catch(() => []),
+]);
+
+if (!document || !recipient) {
+  throw new Response('Not found', { status: 404 });
+}
+```
+
+**令牌权限边界**（详见 5.2.3 节）：
+- ✅ 仅凭 token 可签署非签名字段（TEXT, NUMBER, EMAIL, NAME, DATE, INITIALS, CHECKBOX, RADIO, DROPDOWN）
+- ✅ 仅凭 token 可签署签名字段（当无 ACTION auth 配置时）
+- ✅ 仅凭 token 可完成文档签署（当无 ACCESS 2FA 配置时）
+- ❌ 签署签名字段需要 ACTION auth（配置了 ACCOUNT/PASSKEY/2FA/PASSWORD 时）
+- ❌ 完成文档需要 2FA（配置了 ACCESS 2FA 时）
+
+### 3.3 创作嵌入链路：预签名 Token（仅作对比）
+
+创作嵌入链路使用基于 JWT 的预签名令牌，用于文档/模板编辑场景：
 
 **生成流程**（`packages/lib/server-only/embedding-presign/create-embedding-presign-token.ts:18`）：
 
@@ -172,118 +220,48 @@ const createEmbeddingPresignToken = async ({ apiToken, expiresIn, scope }) => {
 - `iat`（Issued At）：签发时间
 - `exp`（Expiration）：过期时间
 
-### 3.3 预签名令牌验证
+### 3.4 签署主链路的权限校验层级
 
-**验证流程**（`packages/lib/server-only/embedding-presign/verify-embedding-presign-token.ts:12`）：
+`/embed/sign/{token}` 路由采用多层权限校验，全部在 Loader 层完成：
 
-```typescript
-const verifyEmbeddingPresignToken = async ({ token, scope }) => {
-  // 1. 解码 JWT 获取 Claims（不验证签名）
-  const decodedToken = decodeJwt<JWTPayload>(token);
-
-  // 2. 验证必要 Claims 存在且格式正确
-  if (!decodedToken.sub || !decodedToken.aud) {
-    throw new AppError(AppErrorCode.UNAUTHORIZED, 'Invalid presign token format');
-  }
-
-  // 3. 通过 sub 查找原始 API Token
-  const apiToken = await prisma.apiToken.findFirst({
-    where: { id: Number(decodedToken.sub) },
-    include: { user: true },
-  });
-
-  // 4. 验证 aud 与 API Token 所属团队/用户匹配
-  if (audienceId !== apiToken.teamId && audienceId !== apiToken.userId) {
-    throw new AppError(AppErrorCode.UNAUTHORIZED, 'Audience mismatch');
-  }
-
-  // 5. 验证 scope 匹配（如果提供）
-  if (decodedToken.scope && scope && decodedToken.scope !== scope) {
-    throw new AppError(AppErrorCode.UNAUTHORIZED, 'Scope not matched');
-  }
-
-  // 6. 使用 API Token 作为密钥验证 JWT 签名
-  const secret = new TextEncoder().encode(apiToken.token);
-  await jwtVerify(token, secret);
-
-  return { ...apiToken, userId, user };
-};
-```
-
-### 3.4 服务端路由权限校验
-
-在嵌入式路由的 Loader 中，每次请求都会验证令牌：
-
-**Layout 层验证**（`apps/remix/app/routes/embed+/v2+/authoring+/_layout.tsx:26`）：
-
-```typescript
-export const loader = async ({ request }) => {
-  const token = url.searchParams.get('token');
-  if (!token) throw new Response('Invalid token', { status: 404 });
-
-  // 验证预签名令牌
-  const result = await verifyEmbeddingPresignToken({ token }).catch(() => null);
-  if (!result) throw new Response('Invalid token', { status: 404 });
-
-  // 获取组织权限声明
-  const organisationClaim = await getOrganisationClaimByTeamId({
-    teamId: result.teamId,
-  });
-
-  return { token, userId: result.userId, teamId: result.teamId, organisationClaim };
-};
-```
-
-**TRPC API 层验证**（`packages/trpc/server/embedding-router/create-embedding-document.ts:17`）：
-
-```typescript
-export const createEmbeddingDocumentRoute = procedure
-  .input(ZCreateEmbeddingDocumentRequestSchema)
-  .mutation(async ({ input, ctx: { req } }) => {
-    const authorizationHeader = req.headers.get('authorization');
-    const [presignToken] = (authorizationHeader || '').split('Bearer ').filter(Boolean);
-
-    if (!presignToken) {
-      throw new AppError(AppErrorCode.UNAUTHORIZED, 'No presign token provided');
-    }
-
-    // 验证预签名令牌，获取用户上下文
-    const apiToken = await verifyEmbeddingPresignToken({ token: presignToken });
-
-    // 使用令牌关联的用户ID执行后续操作
-    const envelope = await createEnvelope({
-      userId: apiToken.userId,
-      teamId: apiToken.teamId ?? undefined,
-      // ...
-    });
-  });
-```
+| 校验层级 | 检查内容 | 失败处理 | 代码位置 |
+|---------|---------|---------|---------|
+| L1 Token 有效性 | recipient.token 是否存在、对应收件人是否存在 | 404 Not Found | `sign.$token.tsx:58-60` |
+| L2 组织权限 | 组织是否开通 `embedSigning` 功能 | 403 embed-paywall | `sign.$token.tsx:70-79` |
+| L3 收件人状态 | 收件人是否已过期 | 403 embed-recipient-expired | `sign.$token.tsx:81-90` |
+| L4 签署轮次 | 是否轮到该收件人签署 | 403 embed-waiting-for-turn | `sign.$token.tsx:116-127` |
+| L5 Access Auth | 是否需要登录/2FA 认证 | 401 embed-authentication-required | `sign.$token.tsx:92-114` |
+| L6 文档状态 | 文档是否为 PENDING 状态 | 重定向到对应状态页 | `sign.$token.tsx:84-86` |
 
 ### 3.5 功能权限粒度控制
 
-通过 `buildEmbeddedEditorOptions` 实现细粒度功能权限控制：
+通过 URL Hash 配置和组织权限声明实现细粒度功能权限控制：
 
-**权限配置合并**（`packages/lib/utils/embed-config.ts:14`）：
+**Hash 配置权限**（`packages/lib/types/embed-document-sign-schema.ts:6`）：
+- `allowDocumentRejection`：是否允许拒绝文档
+- `lockEmail` / `lockName`：是否锁定邮箱/姓名
+- `darkModeDisabled`：是否禁用深色模式
+- `css` / `cssVars`：自定义 CSS 注入（需组织权限）
+
+**组织权限声明**（`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:62-66`）：
 
 ```typescript
-export const buildEmbeddedEditorOptions = (
-  features: DeepPartial<EnvelopeEditorConfig>,
-  embedded: EnvelopeEditorConfig['embedded'],
-): EnvelopeEditorConfig => {
-  return {
-    embedded,
-    ...buildEmbeddedFeatures(features),
-  };
-};
+const organisationClaim = await getOrganisationClaimByTeamId({ teamId: document.teamId });
+
+const allowEmbedSigningWhitelabel = organisationClaim.flags.embedSigningWhiteLabel;
+const hidePoweredBy = organisationClaim.flags.hidePoweredBy;
 ```
 
-**功能权限分组**：
-- `general`：通用功能（标题配置、步骤控制、侧边栏控制）
-- `settings`：设置权限（签名类型、语言、日期格式、时区等）
-- `actions`：操作权限（附件、分发、下载、删除等）
-- `envelopeItems`：文档项权限（标题、排序、上传、替换等）
-- `recipients`：收件人权限（AI 检测、签署顺序、角色配置等）
-- `fields`：字段权限（AI 检测等）
+**CSS 注入权限检查**（`apps/remix/app/components/embed/embed-document-signing-page-v2.tsx:157`）：
+
+```typescript
+if (allowWhitelabelling) {  // 受组织权限控制
+  injectCss({
+    css: data.css,
+    cssVars: data.cssVars,
+  });
+}
+```
 
 ---
 
@@ -451,46 +429,137 @@ const handleMessage = (event: MessageEvent) => {
 };
 ```
 
-#### 5.2.3 跨域事件中 Token 的敏感性重新评估
+#### 5.2.3 跨域事件中 Token 的敏感性与鉴权边界重新评估
 
-**关键发现**：`document-completed` 和 `document-rejected` 事件中携带的 `token` 字段是 `recipient.token`，这是一个**高度敏感**的认证凭证，而非普通标识符。
+**关键发现**：`document-completed` 和 `document-rejected` 事件中携带的 `token` 字段是 `recipient.token`，这是一个**高度敏感**的认证凭证，但并非所有操作都仅凭 token 即可完成，存在明确的鉴权边界。
 
-**Token 可执行的操作**（`packages/lib/server-only/field/sign-field-with-token.ts:50`）：
+---
+
+##### 🔹 鉴权边界核心规则（代码事实）
+
+**字段类型决定鉴权要求**（`packages/lib/server-only/document/validate-field-auth.ts:28-31`）：
 
 ```typescript
-// 仅需 token 和 fieldId 即可签署字段，无需其他认证
-export const signFieldWithToken = async ({
-  token,           // recipient.token
-  fieldId,
-  value,
-  isBase64,
-  // userId 和 authOptions 是可选的！
-}: SignFieldWithTokenOptions) => {
-  const recipient = await prisma.recipient.findFirstOrThrow({
-    where: { token },  // 仅通过 token 查找收件人
-  });
+// 非签名字段直接跳过所有鉴权
+if (field.type !== FieldType.SIGNATURE) {
+  return undefined;  // ✅ 无需任何鉴权
+}
 
-  // ... 执行字段签署，包括签名字段
-};
+// 只有 SIGNATURE / FREE_SIGNATURE 字段需要 ACTION 级鉴权
+const isValid = await isRecipientAuthorized({
+  type: 'ACTION',
+  // ...
+});
 ```
 
-**完整权限清单**：
+**ACTION 鉴权边界**（`packages/lib/server-only/document/is-recipient-authorized.ts:72-74`）：
 
-| 操作 | 所需参数 | 代码位置 |
-|------|---------|---------|
-| 签署任意字段 | `token` + `fieldId` + `value` | `sign-field-with-token.ts:50` |
-| 完成文档签署 | `token` + `documentId` | `completeDocumentWithToken` API |
-| 查看文档内容 | `token` | `getDocumentAndSenderByToken.ts` |
-| 获取字段列表 | `token` | `getFieldsForToken.ts` |
-| 标记已查看 | `token` | `viewedDocument.ts` |
-| 拒绝文档 | `token` + `reason` | `rejectDocumentWithToken` API |
-| 批量签署 | `tokens[]` + `signature` | `apply-multi-sign-signature.ts:15` |
+```typescript
+// 无鉴权要求或显式指定无需鉴权 → 直接放行
+if (authMethods.length === 0 || 
+    authMethods.some((method) => method === DocumentAuth.EXPLICIT_NONE)) {
+  return true;  // ✅ 仅凭 token 即可
+}
 
-**风险等级评估**：
-- **敏感性**：🔴 极高 - 窃取后可伪造完整签署流程
-- **可滥用性**：🔴 极高 - 仅需 token 即可完成所有操作，无二次认证
-- **影响范围**：🟠 中 - 仅影响对应收件人的特定文档
-- **时效性**：🟡 中 - 文档签署完成或过期后失效
+// 否则需要额外鉴权凭证
+// ACCOUNT: 需要 userId 匹配收件人邮箱
+// PASSKEY: 需要 userId + passkey 认证响应
+// TWO_FACTOR_AUTH: 需要 userId + TOTP 验证码
+// PASSWORD: 需要 userId + 密码
+```
+
+---
+
+##### 🔹 仅凭 token 可执行的操作（无需其他凭证）
+
+| 操作 | 字段类型/说明 | 代码位置 |
+|------|--------------|---------|
+| 签署非签名字段 | TEXT, NUMBER, EMAIL, NAME, DATE, INITIALS, CHECKBOX, RADIO, DROPDOWN | `sign-field-with-token.ts:127-166` |
+| 签署签名字段（无鉴权配置时） | SIGNATURE, FREE_SIGNATURE（当 `actionAuth` 为 `EXPLICIT_NONE` 或未配置时） | `sign-field-with-token.ts:174-190` |
+| 完成文档签署 | 仅当 `accessAuth` 不包含 `TWO_FACTOR_AUTH` 时 | `complete-document-with-token.ts:117-173` |
+| 拒绝文档 | 所有场景 | `reject-document-with-token.ts` |
+| 查看文档内容 | 所有场景 | `get-document-by-token.ts` |
+| 获取字段列表 | 所有场景 | `get-fields-for-token.ts` |
+| 标记已查看 | 所有场景 | `viewed-document.ts` |
+| 获取已签署字段 | 所有场景 | `get-completed-fields-for-token.ts` |
+
+> **⚠️ 重要边界说明**：90% 以上的字段类型（非签名字段）仅凭 token 即可签署，无需任何额外鉴权。只有签名字段在文档配置了 ACTION 鉴权时才需要额外凭证。
+
+---
+
+##### 🔹 必须动作鉴权（ACTION auth）的场景
+
+当文档的 `actionAuth` 配置了以下任一方式时，签署 **SIGNATURE / FREE_SIGNATURE** 字段需要额外凭证：
+
+| 鉴权方式 | 所需额外参数 | 代码位置 |
+|---------|-------------|---------|
+| `ACCOUNT` | `userId`（需与收件人邮箱匹配的登录用户） | `is-recipient-authorized.ts:94-106` |
+| `PASSKEY` | `userId` + passkey 认证响应 + tokenReference | `is-recipient-authorized.ts:107-117` |
+| `TWO_FACTOR_AUTH` | `userId` + TOTP 验证码 | `is-recipient-authorized.ts:118-155` |
+| `PASSWORD` | `userId` + 密码 | `is-recipient-authorized.ts:156-165` |
+
+---
+
+##### 🔹 必须 2FA 的场景
+
+只有一种场景需要 2FA 验证（`complete-document-with-token.ts:117-173`）：
+
+```typescript
+// 仅当 accessAuth 包含 TWO_FACTOR_AUTH 时，完成文档需要 2FA
+if (derivedRecipientAccessAuth.includes(DocumentAuth.TWO_FACTOR_AUTH)) {
+  if (!accessAuthOptions) {
+    throw new AppError(AppErrorCode.UNAUTHORIZED, {
+      message: 'Access authentication required',
+    });
+  }
+  // 验证 2FA 令牌...
+}
+```
+
+**触发条件**：
+- 文档 `accessAuth` 配置包含 `TWO_FACTOR_AUTH`
+- 操作：`completeDocumentWithToken`（完成文档签署）
+- 所需参数：`accessAuthOptions`（包含 2FA token 和 method）
+
+---
+
+##### 🔹 鉴权边界总结
+
+```
+recipient.token
+    │
+    ├─► 非签名字段（TEXT, NUMBER, EMAIL, NAME, DATE,
+    │               INITIALS, CHECKBOX, RADIO, DROPDOWN）
+    │               └─► ✅ 仅凭 token 即可签署
+    │
+    ├─► 签名字段（SIGNATURE, FREE_SIGNATURE）
+    │   │
+    │   ├─► 无 ACTION auth 配置 / EXPLICIT_NONE
+    │   │       └─► ✅ 仅凭 token 即可签署
+    │   │
+    │   └─► 配置 ACTION auth（ACCOUNT/PASSKEY/2FA/PASSWORD）
+    │           └─► ❌ 需要额外鉴权凭证 + userId
+    │
+    └─► 完成文档签署
+        │
+        ├─► 无 ACCESS 2FA 配置
+        │       └─► ✅ 仅凭 token 即可完成
+        │
+        └─► 配置 ACCESS 2FA
+                └─► ❌ 需要 2FA 验证码
+```
+
+---
+
+##### 🔹 风险等级与事件暴露
+
+| 操作 | 敏感性 | 可滥用性 | 备注 |
+|-----|--------|---------|------|
+| 签署非签名字段 | 🔴 高 | 🔴 极高 | 90% 字段类型仅凭 token 即可 |
+| 签署签名字段（无鉴权） | 🔴 极高 | 🔴 极高 | 默认配置下仅凭 token 即可 |
+| 完成文档签署（无 2FA） | 🔴 极高 | 🔴 极高 | 默认配置下仅凭 token 即可 |
+| 拒绝文档 | 🟠 中 | 🟠 中 | 仅凭 token 即可 |
+| 查看文档/字段 | 🟡 中 | 🟠 中 | 仅凭 token 即可 |
 
 **事件暴露情况对比**：
 
@@ -499,23 +568,25 @@ export const signFieldWithToken = async ({
 | `document-ready` | ❌ 否 | 低 |
 | `field-signed` | ❌ 否 | 低 |
 | `field-unsigned` | ❌ 否 | 低 |
-| `document-completed` | ✅ 是 | 极高 |
-| `document-rejected` | ✅ 是 | 极高 |
+| `document-completed` | ✅ 是 | 极高（默认配置下可伪造完整签署） |
+| `document-rejected` | ✅ 是 | 中 |
 | `document-error` | ❌ 否 | 低 |
 | `document-waiting-for-turn` | ❌ 否 | 低 |
 | `recipient-expired` | ❌ 否 | 低 |
 | `all-documents-completed` | ✅ 是（每个文档） | 极高 |
 
-**对宿主端回调处理策略的影响**：
+---
+
+##### 🔹 对宿主端回调处理策略的影响
 
 1. **Origin 验证从「建议」升级为「必须」**：
    - 原结论：`event.origin` 验证是建议性的安全加固
-   - 新结论：**必须**验证，否则恶意父窗口可窃取 `recipient.token` 并伪造签署
+   - 新结论：**必须**验证，否则恶意父窗口可窃取 `recipient.token`，在默认配置下仅凭 token 即可完成整个签署流程
 
 2. **Token 处理策略**：
    - 禁止在前端日志中输出完整 token
    - 禁止将 token 存储在 localStorage/sessionStorage
-   - 建议：宿主端收到 token 后立即通过后端 API 验证并作废（如适用）
+   - 建议：宿主端收到 token 后立即通过后端 API 验证并标记已使用
    - 建议：token 仅用于后端到后端的状态同步，不在前端业务逻辑中使用
 
 3. **回调异常处理**：
@@ -606,24 +677,37 @@ const hidePoweredBy = organisationClaim.flags.hidePoweredBy;
 - 原始 CSS 通过 `<style>` 标签注入
 - 注意：未做 XSS 过滤，依赖组织权限控制
 
-### 5.5 Token 安全边界
+### 5.5 Token 安全边界（签署主链路）
 
-#### 5.5.1 Token 暴露风险
+#### 5.5.1 recipient.token 暴露风险
+
+签署主链路使用 `recipient.token`，这是一个永久有效的凭证（直到文档完成或过期）。
 
 | 风险点 | 说明 | 缓解措施 |
 |-------|------|---------|
-| URL 查询参数 | 预签名 Token 出现在 URL 中，可能被历史记录、日志捕获 | 1. 短期有效期<br>2. 仅可单次使用场景<br>3. HTTPS 传输 |
-| Referer 泄露 | iframe 请求可能通过 Referer 头泄露 Token | 1. 设置 Referrer-Policy<br>2. 服务端验证 Token 有效期 |
-| XSS 窃取 | 宿主页面 XSS 可能窃取 iframe Token | 1. Token 绑定用户/团队<br>2. 短期有效期<br>3. 独立子域名部署 |
+| URL 路径参数 | `recipient.token` 出现在 URL 路径中（`/embed/sign/{token}`），可能被历史记录、日志捕获 | 1. 文档完成后令牌失效<br>2. HTTPS 传输<br>3. 配置合理的文档过期时间 |
+| Referer 泄露 | iframe 请求可能通过 Referer 头泄露 Token | 1. 设置 Referrer-Policy: no-referrer<br>2. 服务端验证文档状态 |
+| XSS 窃取 | 宿主页面 XSS 可能窃取 iframe Token | 1. 独立子域名部署<br>2. CSP 策略隔离 |
+| 跨域事件暴露 | `document-completed` 和 `document-rejected` 事件携带 token | 1. 宿主端必须验证 event.origin<br>2. 禁止前端存储和日志输出 token |
 
-#### 5.5.2 令牌过期策略
+#### 5.5.2 Token 失效策略
 
-```typescript
-// 生产环境：最小5分钟，默认60分钟
-const isDevelopment = env('NODE_ENV') !== 'production';
-const minExpirationMinutes = isDevelopment ? 0 : 5;
-const effectiveExpiresIn = expiresIn >= minExpirationMinutes ? expiresIn : 60;
-```
+`recipient.token` 在以下情况下失效：
+1. 文档状态变为 `COMPLETED`（所有收件人签署完成）
+2. 文档被拒绝（`recipient.signingStatus = REJECTED`）
+3. 文档过期（`recipient.expiredAt < now`）
+4. 文档被删除
+
+#### 5.5.3 令牌安全对比
+
+| 特性 | recipient.token（签署主链路） | 预签名 Token（创作链路） |
+|-----|-----------------------------|-------------------------|
+| 格式 | 随机字符串 | JWT |
+| 有效期 | 直到文档完成/过期 | 5分钟~24小时，可配置 |
+| 绑定 | 特定收件人 + 特定文档 | API Token + 团队/用户 |
+| 存储位置 | URL 路径 | URL 查询参数 |
+| 可执行操作 | 签署文档、查看内容 | 编辑文档、创建模板 |
+| 签名验证 | 数据库查询 | JWT 签名验证 |
 
 ### 5.6 路由访问控制
 
@@ -638,7 +722,73 @@ const effectiveExpiresIn = expiresIn >= minExpirationMinutes ? expiresIn : 60;
 
 ## 六、握手失败场景下的权限收敛处理
 
-### 6.1 握手失败场景分类与处理机制
+### 6.1 主链路说明：/embed/sign 签署入口
+
+嵌入式签署的**主链路**是 `/embed/sign/{token}`（路由定义：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx`），这是实际生产环境使用的签署入口。
+
+**主链路架构**：
+
+```
+/embed/sign/{token}
+    │
+    ├─► Loader 层根据 envelope.internalVersion 分流
+    │   ├─► internalVersion === 2 ──► handleV2Loader() ──► V2 签署页面
+    │   └─► 其他 ──────────────────► handleV1Loader() ──► V1 签署页面
+    │
+    └─► 所有状态异常通过 throw data() 触发 ErrorBoundary 渲染
+```
+
+---
+
+### 6.2 document-ready 触发条件（V1 vs V2 行为对比与统一）
+
+**⚠️ 关键矛盾修正**：V1 和 V2 版本的 `document-ready` 触发条件不一致，需按代码实际情况分别说明。
+
+#### V1 触发条件（`embed-document-signing-page-v1.tsx:242-252`）
+
+```typescript
+useEffect(() => {
+  // ✅ 需要两个条件同时满足
+  if (hasFinishedInit && hasDocumentLoaded && window.parent) {
+    window.parent.postMessage(
+      { action: 'document-ready', data: null },
+      '*',
+    );
+  }
+}, [hasFinishedInit, hasDocumentLoaded]);
+```
+
+- **触发条件**：`hasFinishedInit === true` **且** `hasDocumentLoaded === true`
+- **Hash 解析失败时**：`hasFinishedInit = true` 但 `hasDocumentLoaded` 可能仍为 `false` → **不触发 document-ready**
+
+#### V2 触发条件（`embed-document-signing-page-v2.tsx:181-186`）
+
+```typescript
+useEffect(() => {
+  // ✅ 只需要一个条件
+  if (hasFinishedInit) {
+    onDocumentReady();
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [hasFinishedInit]);
+```
+
+- **触发条件**：`hasFinishedInit === true`（不等待 PDF 加载）
+- **Hash 解析失败时**：catch 块中 `setHasFinishedInit(true)` → **会触发 document-ready**
+
+#### 统一说明与建议
+
+| 场景 | V1 行为 | V2 行为 | 建议宿主端处理 |
+|------|---------|---------|--------------|
+| Hash 解析成功 | ✅ 触发 document-ready（PDF 加载后） | ✅ 触发 document-ready（初始化完成后） | 监听 `document-ready` 作为就绪信号 |
+| Hash 解析失败 | ❌ 不触发 | ✅ 触发（使用默认配置） | 不要依赖 `document-ready` 作为配置成功的唯一信号 |
+| Token 验证失败 | ❌ 不触发（ErrorBoundary） | ❌ 不触发（ErrorBoundary） | 通过 ErrorBoundary 状态处理 |
+
+> **统一结论**：宿主端不应假设 `document-ready` 一定触发或一定不触发，应结合错误页面检测和超时机制做多层防护。
+
+---
+
+### 6.3 握手失败场景分类与处理机制
 
 嵌入式签署组件的握手过程涉及多个环节，每个环节都可能失败。系统采用**"失败安全"（fail-safe）**设计，确保在任何握手失败场景下，权限都会收敛到最保守状态。
 
@@ -679,50 +829,51 @@ useLayoutEffect(() => {
 | `lockName` / `lockEmail` | `false` | 不强制锁定，允许用户输入 |
 
 **生命周期事件收敛**：
-- ❌ 不发送 `document-ready` 事件（若解析失败发生在初始化早期）
+- V1：❌ 不发送 `document-ready`（因为 `hasDocumentLoaded` 可能仍为 false）
+- V2：✅ 发送 `document-ready`（因为只需要 `hasFinishedInit`）
 - ✅ 仍会渲染签署页面，但使用默认配置
 - ⚠️ 风险：用户可能在未授权配置下完成签署，但使用最保守权限
 
-#### 场景 2：预签名 Token 验证失败
+#### 场景 2：Token 验证失败
 
-**触发条件**：
-- Token 格式错误
+**触发条件**（主链路 `/embed/sign/{token}` Loader 层）：
+- Token 格式错误或不存在
+- Token 对应的收件人不存在
 - Token 已过期
 - Token 签名无效
-- Token 所属 API Token 已被吊销
 - Audience（团队/用户ID）不匹配
 
-**代码位置**：
-- Layout 层：`apps/remix/app/routes/embed+/v2+/authoring+/_layout.tsx:35-39`
-- API 层：`packages/lib/server-only/embedding-presign/verify-embedding-presign-token.ts:12`
+**代码位置**：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:34-127`
 
 ```typescript
-// Layout 层验证
-export const loader = async ({ request }) => {
-  const token = url.searchParams.get('token');
-  if (!token) throw new Response('Invalid token', { status: 404 });
+// V1 Loader 验证
+const [document, fields, recipient, completedFields] = await Promise.all([
+  getDocumentAndSenderByToken({ token, ... }).catch(() => null),
+  getFieldsForToken({ token }),
+  getRecipientByToken({ token }).catch(() => null),
+  getCompletedFieldsForToken({ token }).catch(() => []),
+]);
 
-  const result = await verifyEmbeddingPresignToken({ token }).catch(() => null);
-  if (!result) throw new Response('Invalid token', { status: 404 });
-  // ...
-};
+if (!document || !recipient) {
+  throw new Response('Not found', { status: 404 });  // ❌ 完全拒绝
+}
 ```
 
 **权限收敛策略**：
 
 | 验证阶段 | 失败处理 | 权限收敛结果 |
 |---------|---------|-------------|
-| Token 格式检查 | 抛出 404 响应 | ❌ 完全拒绝访问 |
-| API Token 存在性检查 | 抛出 401 错误 | ❌ 完全拒绝访问 |
-| Audience 匹配检查 | 抛出 401 错误 | ❌ 完全拒绝访问 |
-| Scope 匹配检查 | 抛出 401 错误 | ❌ 完全拒绝访问 |
-| JWT 签名验证 | 抛出 401 错误 | ❌ 完全拒绝访问 |
-| Token 过期检查 | 抛出 401 错误 | ❌ 完全拒绝访问 |
+| Token 存在性检查 | 抛出 404 响应 | ❌ 完全拒绝访问 |
+| 收件人存在性检查 | 抛出 404 响应 | ❌ 完全拒绝访问 |
+| Token 过期检查 | 抛出 403 embed-recipient-expired | ❌ 渲染过期页面 |
+| 签署轮次检查 | 抛出 403 embed-waiting-for-turn | ❌ 渲染等待页面 |
+| Access Auth 检查 | 抛出 401 embed-authentication-required | ❌ 渲染认证页面 |
+| 组织权限检查 | 抛出 403 embed-paywall | ❌ 渲染付费墙页面 |
 
 **生命周期事件收敛**：
 - ❌ 不发送任何生命周期事件
 - ❌ 不加载任何签署组件
-- ✅ 通过 ErrorBoundary 渲染通用错误页面
+- ✅ 通过 ErrorBoundary 渲染对应状态页面
 
 **ErrorBoundary 处理**（`apps/remix/app/routes/embed+/_v0+/_layout.tsx:47-95`）：
 
@@ -737,7 +888,12 @@ export function ErrorBoundary() {
     if (error.status === 403 && error.data.type === 'embed-paywall') {
       return <EmbedPaywall />;
     }
-    // ... 其他错误类型
+    if (error.status === 403 && error.data.type === 'embed-recipient-expired') {
+      return <EmbedRecipientExpired />;
+    }
+    if (error.status === 403 && error.data.type === 'embed-waiting-for-turn') {
+      return <EmbedDocumentWaitingForTurn />;
+    }
   }
 
   return <div><Trans>Not Found</Trans></div>;
@@ -751,31 +907,26 @@ export function ErrorBoundary() {
 - 组织未开通白标定制功能
 - 账单状态异常
 
-**代码位置**：`packages/trpc/server/embedding-router/create-embedding-presign-token.ts:34-52`
+**代码位置**：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:70-79`（V1）、`211-220`（V2）
 
 ```typescript
-if (IS_BILLING_ENABLED()) {
-  const organisationClaim = await getOrganisationClaimByTeamId({
-    teamId: token.teamId,
-  });
-
-  if (!organisationClaim.flags.embedAuthoring) {
-    throw new AppError(AppErrorCode.UNAUTHORIZED, {
-      message: 'Embedded Authoring is not included in your current plan.',
-    });
-  }
+if (IS_BILLING_ENABLED() && !organisationClaim.flags.embedSigning) {
+  throw data(
+    { type: 'embed-paywall' },
+    { status: 403 },
+  );
 }
 ```
 
 **权限收敛策略**：
-- ❌ 不生成预签名 Token
-- ❌ API 调用直接失败，返回 401 错误
-- ✅ 宿主端应终止嵌入流程，展示升级提示
+- ❌ 抛出 403 embed-paywall
+- ❌ 不提供签署权限
+- ✅ 通过 ErrorBoundary 渲染付费墙页面
 
 **生命周期事件收敛**：
-- ❌ 不创建 iframe
-- ❌ 不发送任何事件
-- ✅ 宿主端负责处理错误展示
+- ❌ 不发送 `document-ready`
+- ❌ 不发送签署相关事件
+- ✅ 宿主端可通过 iframe 加载状态感知错误
 
 #### 场景 4：收件人状态异常
 
@@ -785,21 +936,23 @@ if (IS_BILLING_ENABLED()) {
 - 签署链接已过期
 - 尚未轮到该收件人签署
 
-**代码位置**：`apps/remix/app/routes/_recipient+/sign.$token+/_index.tsx:137-147`
+**代码位置**：`apps/remix/app/routes/embed+/_v0+/sign.$token.tsx:81-127`
 
 ```typescript
-// Loader 层状态检查
-if (recipient.signingStatus === SigningStatus.REJECTED) {
-  throw redirect(`/sign/${token}/rejected`);
-}
-
+// 检查是否过期
 if (isRecipientExpired(recipient)) {
-  throw redirect(`/sign/${token}/expired`);
+  throw data({ type: 'embed-recipient-expired' }, { status: 403 });
 }
 
-if (document.status === DocumentStatus.COMPLETED || 
-    recipient.signingStatus === SigningStatus.SIGNED) {
-  throw redirect(documentMeta?.redirectUrl || `/sign/${token}/complete`);
+// 检查是否是签署轮次
+const isRecipientsTurnToSign = await getIsRecipientsTurnToSign({ token });
+if (!isRecipientsTurnToSign) {
+  throw data({ type: 'embed-waiting-for-turn' }, { status: 403 });
+}
+
+// 检查 Access Auth
+if (!isAccessAuthValid) {
+  throw data({ type: 'embed-authentication-required', ... }, { status: 401 });
 }
 ```
 
@@ -807,10 +960,11 @@ if (document.status === DocumentStatus.COMPLETED ||
 
 | 收件人状态 | 处理方式 | 权限收敛结果 |
 |-----------|---------|-------------|
-| 已签署 | 重定向到 `/complete` | ✅ 渲染完成页面，不允许重复签署 |
-| 已拒绝 | 重定向到 `/rejected` | ✅ 渲染拒绝页面，不允许更改 |
-| 已过期 | 重定向到 `/expired` | ✅ 渲染过期页面，不允许签署 |
-| 等待轮次 | 重定向到 `/waiting` | ✅ 渲染等待页面，不允许签署 |
+| 已签署 | Loader 中重定向到 `/complete` 或直接返回已完成状态 | ✅ 渲染完成页面，不允许重复签署 |
+| 已拒绝 | Loader 中重定向到 `/rejected` | ✅ 渲染拒绝页面，不允许更改 |
+| 已过期 | throw 403 embed-recipient-expired | ✅ 渲染过期页面，不允许签署 |
+| 等待轮次 | throw 403 embed-waiting-for-turn | ✅ 渲染等待页面，不允许签署 |
+| 需要 Access Auth | throw 401 embed-authentication-required | ✅ 渲染认证页面，要求登录/2FA |
 
 **生命周期事件收敛**（状态页面）：
 
@@ -832,21 +986,58 @@ useEffect(() => {
 - ❌ 不发送 `document-ready` 事件（因为不是可签署状态）
 - ❌ 不提供签署操作入口
 
-### 6.2 握手失败的状态流转图
+---
+
+### 6.4 /embed/sign 主链路状态分流与事件收敛图
+
+**主链路状态分流图**（基于 `apps/remix/app/routes/embed+/_v0+/sign.$token.tsx` 实际代码）：
 
 ```
-握手开始
+/embed/sign/{token}
     │
-    ├─► Token 验证失败 ──► 404 ErrorBoundary ──► 终止（无事件）
+    ├─► Token 无效 ────────────────────────────────► 404 Not Found
+    │    (收件人不存在)                                │
+    │                                                  └─► ❌ 无事件
     │
-    ├─► 权限不足 ───────► 401 API Error ───────► 终止（宿主处理）
+    ├─► 组织无嵌入权限 ─────────────────────────────► 403 embed-paywall
+    │    (!organisationClaim.flags.embedSigning)        │
+    │                                                  └─► ❌ 无事件
     │
-    ├─► 收件人状态异常 ──► 状态页面 ───────────► 发送状态事件（无签署权限）
+    ├─► 收件人已过期 ───────────────────────────────► 403 embed-recipient-expired
+    │    (isRecipientExpired(recipient))                │
+    │                                                  └─► ✅ 发送 recipient-expired
     │
-    ├─► Hash 解析失败 ───► 默认配置 ───────────► document-ready（保守权限）
+    ├─► 不是签署轮次 ───────────────────────────────► 403 embed-waiting-for-turn
+    │    (!isRecipientsTurnToSign)                      │
+    │                                                  └─► ✅ 发送 document-waiting-for-turn
     │
-    └─► 全部成功 ───────► 完整配置 ───────────► document-ready（完整权限）
+    ├─► 需要 Access Auth ───────────────────────────► 401 embed-authentication-required
+    │    (!isAccessAuthValid)                           │
+    │                                                  └─► ❌ 无事件（要求登录/2FA）
+    │
+    └─► 全部验证通过 ────────────────────────────────► 渲染签署页面（V1/V2）
+         │
+         ├─► Hash 解析成功 ────────────────────────► ✅ document-ready（完整权限）
+         │
+         └─► Hash 解析失败 ────────────────────────► V1: ❌ 不发送 document-ready
+                                                    V2: ✅ document-ready（保守权限）
 ```
+
+---
+
+### 6.5 握手失败的事件收敛总结
+
+| 失败场景 | document-ready | 其他事件 | 权限收敛结果 |
+|---------|---------------|---------|-------------|
+| Token 无效/不存在 | ❌ 不发送 | ❌ 不发送 | 完全拒绝访问 |
+| 组织权限不足 | ❌ 不发送 | ❌ 不发送 | 完全拒绝访问 |
+| 收件人已过期 | ❌ 不发送 | ✅ recipient-expired | 禁止签署 |
+| 等待签署轮次 | ❌ 不发送 | ✅ document-waiting-for-turn | 禁止签署 |
+| 需要 Access Auth | ❌ 不发送 | ❌ 不发送 | 要求认证 |
+| Hash 解析失败（V1） | ❌ 不发送 | ✅ 后续签署事件仍可发送 | 保守权限（默认配置） |
+| Hash 解析失败（V2） | ✅ 发送 | ✅ 后续签署事件仍可发送 | 保守权限（默认配置） |
+
+> **统一结论**：`document-ready` 不发送不代表签署流程不可用，宿主端应通过多种信号组合判断状态。
 
 ---
 
@@ -1138,31 +1329,36 @@ useEffect(() => {
 
 ### 8.2 嵌入路由版本
 
-| 版本 | 路由模式 | 用途 |
-|-----|---------|------|
-| V0 | `/embed/v0/sign/:token` | 早期签署嵌入 |
-| V0 | `/embed/v0/direct/:token` | 直接模板嵌入 |
-| V1 | `/embed/v1/authoring/...` | 文档/模板编辑嵌入 |
-| V1 | `/embed/v1/multisign/` | 批量签署嵌入 |
-| V2 | `/embed/v2/authoring/envelope/...` | 信封编辑嵌入 |
+| 版本 | 路由模式 | 用途 | 令牌类型 |
+|-----|---------|------|---------|
+| V0 | `/embed/sign/:token` | **签署主链路**（生产环境使用） | `recipient.token` |
+| V0 | `/embed/v0/direct/:token` | 直接模板嵌入 | `recipient.token` |
+| V1 | `/embed/v1/authoring/...` | 文档/模板编辑嵌入 | 预签名 Token |
+| V1 | `/embed/v1/multisign/` | 批量签署嵌入 | `recipient.token` |
+| V2 | `/embed/v2/authoring/envelope/...` | 信封编辑嵌入 | 预签名 Token |
 
 ---
 
-## 九、关键代码索引
+## 九、关键代码索引（签署主链路）
 
 | 功能模块 | 文件路径 | 关键行 |
 |---------|---------|--------|
-| 预签名令牌生成 | `packages/lib/server-only/embedding-presign/create-embedding-presign-token.ts` | 18 |
-| 预签名令牌验证 | `packages/lib/server-only/embedding-presign/verify-embedding-presign-token.ts` | 12 |
-| 签署页面 V2 | `apps/remix/app/components/embed/embed-document-signing-page-v2.tsx` | 1 |
+| **签署主入口** | `apps/remix/app/routes/embed+/_v0+/sign.$token.tsx` | 1 |
+| V1 签署页面 | `apps/remix/app/components/embed/embed-document-signing-page-v1.tsx` | 1 |
+| V2 签署页面 | `apps/remix/app/components/embed/embed-document-signing-page-v2.tsx` | 1 |
 | 嵌入上下文 | `apps/remix/app/components/embed/embed-signing-context.tsx` | 3 |
-| 配置合并 | `packages/lib/utils/embed-config.ts` | 14 |
 | 签署数据 Schema | `packages/lib/types/embed-document-sign-schema.ts` | 6 |
-| V2 创作布局 | `apps/remix/app/routes/embed+/v2+/authoring+/_layout.tsx` | 26 |
-| 批量签署 | `apps/remix/app/routes/embed+/v1+/multisign+/_index.tsx` | 1 |
+| 字段鉴权边界 | `packages/lib/server-only/document/validate-field-auth.ts` | 28 |
+| 收件人鉴权逻辑 | `packages/lib/server-only/document/is-recipient-authorized.ts` | 53 |
+| 凭 token 签名字段 | `packages/lib/server-only/field/sign-field-with-token.ts` | 50 |
+| 凭 token 完成文档 | `packages/lib/server-only/document/complete-document-with-token.ts` | 54 |
+| 获取收件人 by token | `packages/lib/server-only/recipient/get-recipient-by-token.ts` | 1 |
+| 错误边界处理 | `apps/remix/app/routes/embed+/_v0+/_layout.tsx` | 47 |
+| 等待轮次页面 | `apps/remix/app/components/embed/embed-document-waiting-for-turn.tsx` | 1 |
+| 过期页面 | `apps/remix/app/components/embed/embed-recipient-expired.tsx` | 1 |
 | 测试 playground | `apps/remix/app/routes/embed+/playground.tsx` | 26 |
-| 创建嵌入式文档 | `packages/trpc/server/embedding-router/create-embedding-document.ts` | 14 |
-| 创建预签名令牌 API | `packages/trpc/server/embedding-router/create-embedding-presign-token.ts` | 17 |
+| 预签名令牌生成（创作链路） | `packages/lib/server-only/embedding-presign/create-embedding-presign-token.ts` | 18 |
+| 预签名令牌验证（创作链路） | `packages/lib/server-only/embedding-presign/verify-embedding-presign-token.ts` | 12 |
 
 ---
 
@@ -1173,15 +1369,16 @@ useEffect(() => {
 1. **🔴 宿主端 Origin 验证（必须执行）**：
    - 始终验证 `event.origin`，避免接受伪造消息
    - 原因：`document-completed` 和 `document-rejected` 事件包含高度敏感的 `recipient.token`
+   - 默认配置下仅凭 token 即可完成整个签署流程
 
-2. **Token 有效期控制**：
-   - 根据业务场景设置最短必要的有效期
-   - 生产环境最小 5 分钟，默认 60 分钟
-   - 建议：根据签署流程预估时间，设置 1.5 倍余量
+2. **文档过期时间控制**：
+   - 根据业务场景设置合理的文档过期时间
+   - `recipient.token` 永久有效直到文档完成或过期
+   - 建议：根据签署流程预估时间，设置 1.5 倍余量的过期时间
 
 3. **HTTPS 强制**：
    - 生产环境必须使用 HTTPS，防止传输窃听
-   - Token 出现在 URL 查询参数中，HTTP 环境下完全暴露
+   - Token 出现在 URL 路径中，HTTP 环境下完全暴露
 
 4. **Referrer Policy**：
    - 设置 `Referrer-Policy: no-referrer` 避免 Token 通过 Referer 头泄露
@@ -1191,20 +1388,22 @@ useEffect(() => {
    - 使用独立子域名部署 Documenso，实现跨源隔离
    - 防止宿主页面 XSS 漏洞直接影响嵌入组件
 
-### 10.2 Token 安全处理
+### 10.2 Token 安全处理（签署主链路）
 
-6. **禁止前端存储 Token**：
+6. **🔴 禁止前端存储 recipient.token**：
    - 禁止在 `localStorage`/`sessionStorage` 中存储 `recipient.token`
-   - 禁止在前端日志中输出完整 Token
-   - 建议：Token 仅用于后端到后端的状态同步
+   - 禁止在前端日志中输出完整 token
+   - 建议：token 仅用于后端到后端的状态同步，不在前端业务逻辑中使用
 
 7. **Token 验证机制**：
    - 宿主端收到 `document-completed` 事件后，应立即通过后端 API 验证 Token 有效性
+   - 验证内容：文档状态、收件人状态、签署完成时间
    - 不要直接信任前端回调数据，以防伪造
 
-8. **定期轮换**：
-   - API Token 定期轮换，降低泄露影响
-   - 预签名 Token 本身为短期有效，无需额外轮换
+8. **Token 使用范围控制**：
+   - `recipient.token` 绑定特定文档和收件人，不可跨文档使用
+   - 文档完成或过期后，token 自动失效
+   - 建议：关键业务操作应使用后端到后端的 API 调用，不依赖前端传递的 token
 
 ### 10.3 回调处理安全
 
@@ -1236,18 +1435,24 @@ useEffect(() => {
     - 设置合理的签署超时时间（如 30 分钟）
     - 超时后主动查询后端状态，避免状态不一致
 
-### 10.5 集成检查清单
+### 10.5 集成检查清单（签署主链路）
 
 ✅ **集成前检查**：
 - [ ] 已启用 HTTPS
 - [ ] 已配置正确的 CSP 策略
-- [ ] 已实现 `event.origin` 验证
+- [ ] 已实现 `event.origin` 验证（必须执行）
 - [ ] 已规划后端 Webhook 接收签署通知
 - [ ] 已设计超时和重试机制
-- [ ] 已确认 Token 不会被记录到应用日志
+- [ ] 已确认 `recipient.token` 不会被记录到应用日志
+- [ ] 已明确文档鉴权配置（ACTION auth / ACCESS 2FA）
+- [ ] 已了解 V1 和 V2 版本 `document-ready` 触发条件差异
 
 ✅ **上线前检查**：
 - [ ] 渗透测试确认无 XSS 漏洞
 - [ ] 安全审计确认 Token 处理符合规范
 - [ ] 异常场景测试通过（网络中断、超时、重复提交）
 - [ ] 监控告警已配置（签署失败率、异常错误率）
+- [ ] 已验证 Hash 解析失败场景的降级行为
+- [ ] 已验证握手失败场景的错误页面展示
+- [ ] 已验证 `document-ready` 触发/不触发场景的处理逻辑
+- [ ] 已确认文档过期时间设置合理

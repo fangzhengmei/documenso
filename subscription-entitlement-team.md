@@ -517,18 +517,82 @@ PLATFORM档位的配置体现了分层设计：
 | 1 | `allowCustomBranding` | 管理后台元标记 | UI显示标签，不直接控制执行 |
 | 2 | `hidePoweredBy` | 邮件模板、PDF生成器、签署页面 | 隐藏"Powered by Documenso"标识 |
 | 3 | `unlimitedDocuments` | `getServerLimits()` | 绕过月度文档数量限制 |
-| 4 | `emailDomains` | 未找到实际检查点 | 预留企业版功能 |
+| 4 | `emailDomains` | 3个服务端模块 + 6个前端UI | 企业版邮箱域名管理（自定义发件域名） |
 | 5 | `embedAuthoring` | `create-embedding-presign-token.ts` | 嵌入编辑功能入口控制 |
 | 6 | `embedAuthoringWhiteLabel` | `embed/v2/authoring/_layout.tsx` | 嵌入编辑自定义CSS注入 |
 | 7 | `embedSigning` | 签署页面路由 | 嵌入签署功能入口控制 |
 | 8 | `embedSigningWhiteLabel` | `load-recipient-branding.ts` | 收件人签署页自定义品牌 |
 | 9 | `cfr21` | 6个服务端模块 + 8个前端UI | 21 CFR合规认证要求 |
 | 10 | `hipaa` | 未找到实际检查点 | 预留合规标记 |
-| 11 | `authenticationPortal` | 未找到实际检查点 | 预留企业版功能 |
+| 11 | `authenticationPortal` | 3个服务端模块 + 3个前端UI | 企业版SSO认证门户 |
 | 12 | `allowLegacyEnvelopes` | `folder-grid.tsx` | 旧版文档上传按钮显示 |
 | 13 | `signingReminders` | 未找到实际检查点 | 预留功能 |
 
-> **备注**：`emailDomains`、`hipaa`、`authenticationPortal`、`signingReminders` 4个flag已在schema中定义，但暂未找到实际执行检查点，属于预留功能。
+> **备注**：`hipaa`、`signingReminders` 2个flag已在schema中定义，但暂未找到实际执行检查点，属于预留功能。
+
+### 4.7 emailDomains 检查点详细分析
+
+**功能**：企业版邮箱域名管理，允许组织配置自定义发件域名、验证域名所有权、管理域名邮箱列表。
+
+**检查点分布在2个服务端模块 + 多个前端UI控制点**：
+
+#### 服务端检查点（共3处）
+
+| 模块 | 文件位置 | 检查场景 | 逻辑 |
+|------|----------|----------|------|
+| 域名创建 | `packages/trpc/server/enterprise-router/create-organisation-email-domain.ts:50-54` | 创建新的邮箱域名时 | flag未开启则抛出 `INVALID_BODY` 错误 |
+| 域名验证 | `packages/trpc/server/enterprise-router/verify-organisation-email-domain.ts:41` | 验证域名所有权时 | 路由meta中声明需要 `emailDomains: true` 权限 |
+| 邮件上下文 | `packages/lib/server-only/email/get-email-context.ts:221-223` | 获取可用发件邮箱列表时 | flag未开启则返回空数组 |
+
+**核心检查代码**（创建域名时）：
+```typescript
+if (!organisation.organisationClaim.flags.emailDomains) {
+  throw new AppError(AppErrorCode.INVALID_BODY, {
+    message: 'Email domains are not enabled for this organisation',
+  });
+}
+```
+
+**前端UI控制点**（共6处）：
+- `packages/ui/primitives/template-flow/add-template-settings.tsx:463` - 模板设置中的发件邮箱选择
+- `packages/ui/primitives/document-flow/add-subject.tsx:193` - 文档设置中的发件邮箱选择
+- `apps/remix/app/routes/_authenticated+/o.$orgUrl.settings.email-domains._index.tsx:28` - 邮箱域名设置页面入口
+- `apps/remix/app/routes/_authenticated+/o.$orgUrl.settings._layout.tsx:96` - 设置菜单隐藏/显示
+- `apps/remix/app/components/general/envelope-editor/envelope-editor-settings-dialog.tsx:735` - 信封编辑器中的发件人配置
+- `apps/remix/app/components/forms/email-preferences-form.tsx:66` - 邮件偏好设置
+- `apps/remix/app/components/dialogs/envelope-distribute-dialog.tsx:252,277` - 发送对话框中的发件邮箱选择
+
+### 4.8 authenticationPortal 检查点详细分析
+
+**功能**：企业版认证门户，支持 SSO 单点登录配置（OIDC 协议）、用户自动配置、域名白名单等。
+
+**检查点分布在3个服务端模块 + 多个前端UI控制点**：
+
+#### 服务端检查点（共3处）
+
+| 模块 | 文件位置 | 检查场景 | 逻辑 |
+|------|----------|----------|------|
+| 获取配置 | `packages/trpc/server/enterprise-router/get-organisation-authentication-portal.ts:68-72` | 读取SSO配置时 | flag未开启则抛出 `NOT_FOUND` 错误 |
+| 更新配置 | `packages/trpc/server/enterprise-router/update-organisation-authentication-portal.ts:50` | 更新SSO配置时 | flag未开启则抛出 `NOT_FOUND` 错误 |
+| SSO登录 | `packages/auth/server/lib/utils/organisation-portal.ts:50-52` | 组织SSO登录入口 | flag未开启或配置未启用则抛出 `NOT_SETUP` 错误 |
+
+**核心检查代码**（SSO登录时）：
+```typescript
+if (
+  !organisation.organisationClaim.flags.authenticationPortal ||
+  !organisation.organisationAuthenticationPortal.enabled
+) {
+  throw new AppError(AppErrorCode.NOT_SETUP, {
+    message: 'Authentication portal is not enabled for this organisation',
+  });
+}
+```
+
+**前端UI控制点**（共3处）：
+- `apps/remix/app/routes/_authenticated+/o.$orgUrl.settings.sso.tsx:66` - SSO设置页面
+- `apps/remix/app/routes/_authenticated+/o.$orgUrl.settings._layout.tsx:103` - 设置菜单隐藏/显示
+- `apps/remix/app/routes/_unauthenticated+/o.$orgUrl.signin.tsx:74` - 组织登录页面SSO按钮显示
+- `apps/remix/app/routes/_unauthenticated+/organisation.sso.confirmation.$token.tsx` - SSO账号确认流程
 
 ---
 
@@ -906,7 +970,7 @@ Organisation (1)
 4. **PLATFORM档位矛盾配置**：`embedAuthoring: false` 但 `embedAuthoringWhiteLabel: true`，设计意图不清晰
 5. **allowCustomBranding名不副实**：flag名称与实际使用不符，易引起误解
 6. **backport job字段不完整**：`backport-subscription-claims` Job schema缺少 `emailDomains`、`authenticationPortal`、`allowLegacyEnvelopes` 3个字段，导致回溯更新时这3个flag无法批量同步
-7. **预留flag无检查点**：`emailDomains`、`hipaa`、`authenticationPortal`、`signingReminders` 4个flag已在schema定义但无实际执行检查点
+7. **预留flag无检查点**：`hipaa`、`signingReminders` 2个flag已在schema定义但无实际执行检查点
 
 ### 7.2 优化建议
 

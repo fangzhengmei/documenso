@@ -661,7 +661,7 @@ validateDropdownField(value: string | undefined, fieldMeta: TDropdownFieldMeta, 
 
 ---
 
-## 五、V2 路径错误回传链路详解
+## 五、V2 路径错误回传链路详解（逐行代码核对版）
 
 ### 5.1 错误来源与错误码映射表
 
@@ -689,95 +689,277 @@ validateDropdownField(value: string | undefined, fieldMeta: TDropdownFieldMeta, 
 
 ---
 
-### 5.2 错误回传完整链路图
+### 5.2 错误回传完整链路（逐行核对）
+
+#### 5.2.1 后端到前端的错误数据转换
 
 ```
-后端抛出 AppError (或 Zod 校验失败)
+后端抛出 AppError
     │
-    ▼  Step 1: tRPC errorFormatter 格式化
+    │  示例（认证失败）：
+    │  // validate-field-auth.ts:41-45
+    │  throw new AppError(AppErrorCode.UNAUTHORIZED, {
+    │    message: 'Invalid authentication values',
+    │  });
+    │
+    ▼  Step 1: tRPC 错误捕获与 cause 传递
+    │  tRPC 自动将 AppError 包装为 TRPCError
+    │  TRPCError {
+    │    code: 'UNAUTHORIZED',           // 从 AppErrorCode 映射
+    │    message: 'Invalid authentication values',
+    │    cause: AppError                 // 原始 AppError 对象
+    │  }
+    │
+    ▼  Step 2: tRPC errorFormatter 格式化
     │  文件: packages/trpc/server/trpc.ts:38-66
     │
     │  输入: { shape, error: TRPCError, ctx }
     │  处理:
-    │  - 提取 originalError = error.cause
-    │  - 如果 originalError instanceof AppError:
-    │    data = {
-    │      ...shape.data,
-    │      appError: AppError.toJSON(originalError),
-    │              // { code, message, userMessage, statusCode }
-    │      code: originalError.code,
-    │      httpStatus: originalError.statusCode ?? map[code]?.status ?? 400
+    │    const originalError = error.cause;  // 提取 AppError
+    │
+    │    if (originalError instanceof AppError) {
+    │      data = {
+    │        ...shape.data,
+    │        appError: AppError.toJSON(originalError),
+    │                // { code: 'UNAUTHORIZED', message: 'Invalid authentication values' }
+    │                // 注意: userMessage/statusCode 未设置则不包含
+    │        code: 'UNAUTHORIZED',
+    │        httpStatus: 401,  // 从 genericErrorCodeToTrpcErrorCodeMap 映射
+    │      };
     │    }
     │
-    ▼  Step 2: tRPC 错误日志处理
+    ▼  Step 3: tRPC 错误日志处理
     │  文件: packages/trpc/utils/trpc-error-handler.ts:7-36
     │
-    │  - 解析 appError = AppError.parseError(error.cause || error)
-    │  - 500 错误或 UNKNOWN_ERROR 记录 error 级别
-    │  - 其他错误记录 info 级别
+    │  const appError = AppError.parseError(error.cause || error);
+    │  - code === 'UNKNOWN_ERROR' 或 httpStatus >= 500 → error 级别日志
+    │  - 其他错误 → info 级别日志
     │
-    ▼  Step 3: tRPC 客户端接收
+    ▼  Step 4: tRPC 客户端接收
     │
-    │  前端收到 TRPCClientError，包含:
+    │  前端收到 TRPCClientError 对象:
     │  {
     │    name: 'TRPCClientError',
-    │    message: string,
+    │    message: 'UNAUTHORIZED: Invalid authentication values',
     │    data: {
-    │      appError: { code, message, userMessage, statusCode },
-    │      code: string,
-    │      httpStatus: number,
+    │      appError: {
+    │        code: 'UNAUTHORIZED',
+    │        message: 'Invalid authentication values'
+    │      },
+    │      code: 'UNAUTHORIZED',
+    │      httpStatus: 401,
+    │      path: 'envelope.field.sign',
     │      ...
-    │    }
+    │    },
+    │    cause: undefined  // 注意: cause 在客户端丢失
     │  }
-    │
-    ▼  Step 4: 前端 AppError.parseError 解析
-    │  文件: packages/lib/errors/app-error.ts:130-168
-    │
-    │  处理逻辑:
-    │  1. if (error instanceof AppError) return error
-    │  2. if (error?.name === 'TRPCClientError'):
-    │     - 尝试从 error.data?.appError 解析
-    │     - 解析失败则返回 fallback (UNKNOWN_ERROR)
-    │  3. 其他情况转换为 UNKNOWN_ERROR
-    │
-    ▼  Step 5: 前端错误展示 (分支逻辑)
-    │
-    ├─ 分支A: UNAUTHORIZED 错误 → 重新抛出
-    │   触发条件: error.code === AppErrorCode.UNAUTHORIZED
-    │   代码位置: envelope-signer-page-renderer.tsx:465-466
-    │   处理: throw error → 由认证上下文处理重新认证
-    │
-    ├─ 分支B: 其他所有错误 → Toast 全局提示
-    │   触发条件: error.code !== UNAUTHORIZED
-    │   代码位置: envelope-signer-page-renderer.tsx:467-471
-    │   处理:
-    │     toast({
-    │       title: t`Error`,
-    │       description: t`An error occurred while signing the field.`,
-    │       variant: 'destructive'
-    │     })
-    │
-    └─ 分支C: 对话框前端校验错误 → 字段级 FormMessage
-        触发条件: 对话框内 Zod 校验失败
-        代码位置: 各 sign-field-*-dialog.tsx
-        处理: FormMessage 组件实时显示错误消息
 ```
 
 ---
 
-### 5.3 前端错误展示触发条件与代码对应
+#### 5.2.2 V2 路径 signField catch 分支实际执行顺序
+
+**⚠️ 重要发现：V2 路径 signField 中 没有 AppError.parseError 调用，也没有 UNAUTHORIZED 检查**
+
+**代码位置**: `envelope-signer-page-renderer.tsx:449-475`
+
+```typescript
+const signField = async (fieldId: number, payload: TSignEnvelopeFieldValue, authOptions?: TRecipientActionAuth) => {
+  try {
+    const { inserted } = await signFieldInternal(fieldId, payload, authOptions);
+    
+    // 嵌入上下文回调
+    if (inserted && onFieldSigned) { /* ... */ }
+    if (!inserted && onFieldUnsigned) { /* ... */ }
+  } catch (err) {
+    // ┌─────────────────────────────────────────────────────────┐
+    // │  Step 1: 先打印错误日志                                 │
+    // │  输入: err 是 TRPCClientError 对象（原始错误）          │
+    // └─────────────────────────────────────────────────────────┘
+    console.error(err);
+
+    // ┌─────────────────────────────────────────────────────────┐
+    // │  Step 2: 无条件显示 Toast（包括 UNAUTHORIZED 错误！）   │
+    // │  ⚠️  Bug: 认证失败也会先显示 "Error" Toast              │
+    // └─────────────────────────────────────────────────────────┘
+    toast({
+      title: t`Error`,
+      description: t`An error occurred while signing the field.`,
+      variant: 'destructive',
+    });
+
+    // ┌─────────────────────────────────────────────────────────┐
+    // │  Step 3: 抛出原始错误（未解析，仍是 TRPCClientError）   │
+    // │  没有检查 error.code === UNAUTHORIZED                   │
+    // │  没有调用 AppError.parseError(err)                      │
+    // └─────────────────────────────────────────────────────────┘
+    throw err;
+  }
+};
+```
+
+**执行顺序总结**：
+1. `console.error(err)` → **先**打印日志
+2. `toast({...})` → **再**显示 Toast（所有错误，包括 UNAUTHORIZED）
+3. `throw err` → **最后**抛出原始错误
+
+---
+
+#### 5.2.3 V1 路径 catch 分支实际执行顺序（对比）
+
+**代码位置**: `document-signing-email-field.tsx:72-88`
+
+```typescript
+catch (err) {
+  // ┌─────────────────────────────────────────────────────────┐
+  // │  Step 1: 先解析错误                                     │
+  // └─────────────────────────────────────────────────────────┘
+  const error = AppError.parseError(err);
+
+  // ┌─────────────────────────────────────────────────────────┐
+  // │  Step 2: 检查认证错误                                   │
+  // │  是 UNAUTHORIZED → 直接 throw，不 toast                 │
+  // └─────────────────────────────────────────────────────────┘
+  if (error.code === AppErrorCode.UNAUTHORIZED) {
+    throw error;
+  }
+
+  // ┌─────────────────────────────────────────────────────────┐
+  // │  Step 3: 非认证错误才打印日志和 toast                    │
+  // └─────────────────────────────────────────────────────────┘
+  console.error(err);
+
+  toast({
+    title: _(msg`Error`),
+    description: isAssistantMode
+      ? _(msg`An error occurred while signing as assistant.`)
+      : _(msg`An error occurred while signing the document.`),
+    variant: 'destructive',
+  });
+}
+```
+
+**执行顺序总结**：
+1. `AppError.parseError(err)` → **先**解析
+2. `if (error.code === UNAUTHORIZED) throw error` → **再**检查，认证错误直接抛出（无 Toast）
+3. `console.error(err)` → 非认证错误才打印
+4. `toast({...})` → 非认证错误才 Toast
+
+---
+
+#### 5.2.4 V2 UNAUTHORIZED 错误完整流向（签名字段场景）
+
+```
+用户点击签名字段（有认证要求）
+    │
+    ▼  envelope-signer-page-renderer.tsx:360-392
+handleSignatureFieldClick() 返回 payload { type: SIGNATURE, value: 'xxx' }
+    │
+    ▼  payload.value 存在 → 走认证流程
+void executeActionAuthProcedure({
+  onReauthFormSubmit: async (authOptions) => {
+    await signField(field.id, payload, authOptions);  // 🔴 这里抛出的错误由谁捕获？
+    loadingSpinnerGroup.destroy();
+  },
+  actionTarget: field.type,
+});
+    │
+    ▼  onReauthFormSubmit 在认证对话框中被调用
+    │  document-signing-auth-password.tsx:50-69
+    │
+    ▼  Step 1: signField 内部调用
+    │  signFieldInternal → 后端 API → validateFieldAuth
+    │
+    ▼  Step 2: 后端认证失败
+    │  validate-field-auth.ts:41-45
+    │  throw new AppError(UNAUTHORIZED, { message: 'Invalid authentication values' })
+    │
+    ▼  Step 3: 错误经过 tRPC 链路到达前端
+    │  TRPCClientError { data: { code: 'UNAUTHORIZED', ... } }
+    │
+    ▼  Step 4: signField catch 捕获（不检查错误码）
+    │  envelope-signer-page-renderer.tsx:464-474
+    │  1. console.error(err)
+    │  2. toast({ title: 'Error', description: 'An error occurred...' })
+    │  3. throw err  ← 🔴 重新抛出
+    │
+    ▼  Step 5: 认证表单 catch 捕获
+    │  document-signing-auth-password.tsx:62-69
+    │
+    │  try {
+    │    await onReauthFormSubmit({ type: PASSWORD, password });
+    │  } catch (err) {
+    │    setIsCurrentlyAuthenticating(false);
+    │
+    │    const error = AppError.parseError(err);  // ✅ 这里才解析
+    │    setFormErrorCode(error.code);            // 'UNAUTHORIZED'
+    │    // 不关闭对话框，不 toast（已由 signField 显示过）
+    │  }
+    │
+    └─ 最终效果：
+       - Toast 显示 "Error: An error occurred while signing the field."
+       - 认证对话框保持打开
+       - 表单错误码设为 'UNAUTHORIZED'（但未显示给用户）
+```
+
+---
+
+### 5.3 AppError.parseError 解析逻辑详解
+
+**文件**: `packages/lib/errors/app-error.ts:130-168`
+
+```typescript
+static parseError(error: any): AppError {
+  // 分支1: 已是 AppError → 直接返回
+  if (error instanceof AppError) {
+    return error;
+  }
+
+  // 分支2: TRPCClientError → 从 data.appError 解析
+  if (error?.name === 'TRPCClientError') {
+    const parsedJsonError = AppError.parseFromJSON(error.data?.appError);
+    // parsedJsonError = AppError {
+    //   code: 'UNAUTHORIZED',
+    //   message: 'Invalid authentication values',
+    //   userMessage: undefined,
+    //   statusCode: undefined
+    // }
+
+    const fallbackError = new AppError(AppErrorCode.UNKNOWN_ERROR, {
+      message: error?.message,
+    });
+
+    return parsedJsonError || fallbackError;
+  }
+
+  // 分支3: 未知错误 → 转换为 UNKNOWN_ERROR
+  const { code, message, userMessage, statusCode } = error as { ... };
+  const validCode = typeof code === 'string' ? code : AppErrorCode.UNKNOWN_ERROR;
+  
+  return new AppError(validCode, { message, userMessage, statusCode });
+}
+```
+
+**V2 路径中的调用位置**：
+- ❌ `envelope-signer-page-renderer.tsx:449-475`（signField）→ **不调用**
+- ✅ `document-signing-auth-password.tsx:65`（认证表单）→ **调用**
+- ✅ `envelope-signing-complete-dialog.tsx:125`（完成签署）→ **调用**
+
+---
+
+### 5.4 前端错误展示触发条件与代码对应（修正版）
 
 | 展示方式 | 触发条件 | 代码位置 | 展示效果 |
 |---------|---------|---------|---------|
 | **对话框表单错误** | 对话框内 Zod 校验失败 | `sign-field-email-dialog.tsx:60-63` | 输入框下方红色文字 |
-| **Toast 全局提示** | 后端返回任何错误（除 UNAUTHORIZED） | `envelope-signer-page-renderer.tsx:464-474` | 右上角红色 Toast |
-| **重新抛出认证** | 错误码为 UNAUTHORIZED | `envelope-signer-page-renderer.tsx:465-466` | 触发重新认证流程 |
+| **Toast 全局提示** | 后端返回**任何**错误（含 UNAUTHORIZED） | `envelope-signer-page-renderer.tsx:464-474` | 右上角红色 Toast |
+| **认证表单错误码** | 签名字段认证失败，错误被认证对话框 catch | `auth-password.tsx:65-66` | 设置 `formErrorCode`，但未显示给用户 |
 | **字段 Tooltip** | 点击 Complete 时存在未插入字段 | `document-signing-form.tsx:116-120` | 字段旁黄色 Tooltip + 滚动定位 |
 | **字段红色边框** | 提交验证时未插入字段 | `fields.ts:38-40` | 字段边框变红 |
 
 ---
 
-### 5.4 错误码到 HTTP 状态码映射
+### 5.5 错误码到 HTTP 状态码映射
 
 **文件**: `packages/lib/errors/app-error.ts:32-53`
 
@@ -791,6 +973,70 @@ validateDropdownField(value: string | undefined, fieldMeta: TDropdownFieldMeta, 
 | `TOO_MANY_REQUESTS` | `TOO_MANY_REQUESTS` | 429 |
 | `UNKNOWN_ERROR` | `INTERNAL_SERVER_ERROR` | 500 |
 | 默认 | `BAD_REQUEST` | 400 |
+
+---
+
+### 5.6 V1 与 V2 错误处理边界差异（逐行对比）
+
+| 对比项 | V1 路径 (Document) | V2 路径 (Envelope) |
+|--------|-------------------|-------------------|
+| **catch 位置** | `document-signing-*-field.tsx` | `envelope-signer-page-renderer.tsx` |
+| **AppError.parseError 调用** | ✅ catch 开头第一行 | ❌ signField 中不调用<br>✅ 仅认证对话框中调用 |
+| **UNAUTHORIZED 检查** | ✅ 检查后直接 throw，不 toast | ❌ 不检查，所有错误都 toast |
+| **执行顺序** | `parse → check UNAUTHORIZED → console.error → toast` | `console.error → toast → throw` |
+| **UNAUTHORIZED 时是否 toast** | ❌ 不 toast | ✅ 先 toast 再 throw |
+| **错误消息内容** | 区分助理模式：<br>- "An error occurred while signing as assistant."<br>- "An error occurred while signing the document." | 固定消息：<br>"An error occurred while signing the field." |
+| **throw 的错误类型** | `AppError`（已解析） | `TRPCClientError`（原始） |
+| **throw 后的处理** | 由上层认证上下文捕获 | 由认证对话框表单 catch |
+| **用户体验（认证失败）** | 无干扰 Toast，直接在认证表单内反馈 | 先弹出通用错误 Toast，再显示认证失败 |
+
+---
+
+### 5.7 V2 错误处理现存问题（基于代码核对）
+
+| 问题描述 | 代码位置 | 影响 |
+|---------|---------|------|
+| **认证失败时不必要的 Toast** | `envelope-signer-page-renderer.tsx:467-471` | 用户看到 "Error" Toast，造成困惑 |
+| **缺少 AppError.parseError 调用** | `envelope-signer-page-renderer.tsx:464-474` | 无法区分错误类型进行差异化处理 |
+| **缺少 UNAUTHORIZED 分支处理** | `envelope-signer-page-renderer.tsx:464-474` | 认证错误与其他错误同样处理 |
+| **执行顺序不合理** | `envelope-signer-page-renderer.tsx:464-474` | console.error 在最前，toast 在 throw 之前 |
+| **认证错误码未展示** | `auth-password.tsx:65-66` | `setFormErrorCode(error.code)` 但未显示给用户 |
+
+**代码优化建议（V2 signField catch）**：
+
+**优化前** (`envelope-signer-page-renderer.tsx:464-474`):
+```typescript
+catch (err) {
+  console.error(err);
+
+  toast({
+    title: t`Error`,
+    description: t`An error occurred while signing the field.`,
+    variant: 'destructive',
+  });
+
+  throw err;
+}
+```
+
+**优化后**:
+```typescript
+catch (err) {
+  const error = AppError.parseError(err);
+
+  if (error.code === AppErrorCode.UNAUTHORIZED) {
+    throw error;
+  }
+
+  console.error(err);
+
+  toast({
+    title: t`Error`,
+    description: t`An error occurred while signing the field.`,
+    variant: 'destructive',
+  });
+}
+```
 
 ---
 
@@ -945,9 +1191,13 @@ if (errors.length > 0) {
 
 | 问题描述 | 位置 | 影响 |
 |---------|------|------|
+| **V2 signField 缺少 AppError.parseError** | `envelope-signer-page-renderer.tsx:464-474` | 无法区分错误类型进行差异化处理 |
+| **V2 signField 缺少 UNAUTHORIZED 检查** | `envelope-signer-page-renderer.tsx:464-474` | 认证失败也会显示通用 Error Toast，用户体验差 |
+| **V2 signField 执行顺序不合理** | `envelope-signer-page-renderer.tsx:464-474` | `console.error → toast → throw`，应先解析错误 |
 | **V1 路径错误处理不一致** | `sign-field-with-token.ts:131-133` | 使用普通 `Error` 而非 `AppError`，丢失错误码 |
 | **TEXT 校验错误消息错误** | `envelope-signing.ts:131` | 错误消息为 "Invalid email"，应为 "Invalid text" |
 | **INITIALS 返回值 Bug** | `initial-field.ts:43` | 返回 `initials` 而非 `initialsToInsert`，可能导致值不正确 |
+| **认证错误码未展示给用户** | `auth-password.tsx:65-66` | `setFormErrorCode(error.code)` 但未显示 |
 | **校验逻辑重复** | V1 与 V2 路径 | 状态校验逻辑重复，维护成本高 |
 | **错误消息硬编码** | 所有 validate-*.ts | 校验函数中错误消息为英文硬编码，未使用 i18n |
 | **V1 EMAIL/NAME/INITIALS 无校验** | V1 路径 | 存在数据安全隐患 |
@@ -1017,7 +1267,45 @@ return {
 };
 ```
 
-#### 优化点4：错误消息国际化
+#### 优化点4：V2 signField 错误处理逻辑修正
+
+**问题**：缺少错误解析和 UNAUTHORIZED 检查，所有错误都 toast
+
+**优化前** (`envelope-signer-page-renderer.tsx:464-474`):
+```typescript
+catch (err) {
+  console.error(err);
+
+  toast({
+    title: t`Error`,
+    description: t`An error occurred while signing the field.`,
+    variant: 'destructive',
+  });
+
+  throw err;
+}
+```
+
+**优化后**:
+```typescript
+catch (err) {
+  const error = AppError.parseError(err);
+
+  if (error.code === AppErrorCode.UNAUTHORIZED) {
+    throw error;
+  }
+
+  console.error(err);
+
+  toast({
+    title: t`Error`,
+    description: t`An error occurred while signing the field.`,
+    variant: 'destructive',
+  });
+}
+```
+
+#### 优化点5：错误消息国际化
 
 **问题**：校验函数返回硬编码英文消息
 
@@ -1031,4 +1319,24 @@ return ['Value is required'];
 return [
   { code: 'FIELD_REQUIRED', params: { fieldType: 'TEXT' } }
 ];
+```
+
+#### 优化点6：认证对话框展示错误码
+
+**问题**：`setFormErrorCode(error.code)` 但未显示给用户
+
+**优化建议**：在认证对话框中根据错误码显示对应的错误消息。
+
+```typescript
+// 在 auth-password.tsx 中添加
+{formErrorCode === AppErrorCode.UNAUTHORIZED && (
+  <Alert variant="destructive">
+    <AlertTitle>
+      <Trans>Authentication failed</Trans>
+    </AlertTitle>
+    <AlertDescription>
+      <Trans>The password you entered is incorrect.</Trans>
+    </AlertDescription>
+  </Alert>
+)}
 ```

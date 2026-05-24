@@ -42,27 +42,40 @@ model OrganisationClaim {
 
 ### 1.2 功能开关（Flags）定义与真实数量
 
-在 `packages/lib/types/subscription.ts:9-38` 中定义了**12个**功能开关：
+在 `packages/lib/types/subscription.ts:9-38` 中定义了**13个**功能开关：
 
 ```typescript
 export const ZClaimFlagsSchema = z.object({
-  allowCustomBranding: z.boolean().optional(),      // 自定义品牌（元标记）
-  hidePoweredBy: z.boolean().optional(),            // 隐藏"Powered by"标识
-  unlimitedDocuments: z.boolean().optional(),       // 无限文档
-  emailDomains: z.boolean().optional(),             // 邮箱域名管理（企业版）
-  embedAuthoring: z.boolean().optional(),           // 嵌入编辑功能访问
-  embedAuthoringWhiteLabel: z.boolean().optional(), // 嵌入编辑白标
-  embedSigning: z.boolean().optional(),             // 嵌入签署功能访问
-  embedSigningWhiteLabel: z.boolean().optional(),   // 嵌入签署白标
-  cfr21: z.boolean().optional(),                    // 21 CFR合规
-  hipaa: z.boolean().optional(),                    // HIPAA合规（预留）
-  authenticationPortal: z.boolean().optional(),     // 认证门户（企业版）
-  allowLegacyEnvelopes: z.boolean().optional(),     // 允许旧版信封
-  signingReminders: z.boolean().optional(),         // 签署提醒
+  allowCustomBranding: z.boolean().optional(),      // [1] 自定义品牌（元标记）
+  hidePoweredBy: z.boolean().optional(),            // [2] 隐藏"Powered by"标识
+  unlimitedDocuments: z.boolean().optional(),       // [3] 无限文档
+  emailDomains: z.boolean().optional(),             // [4] 邮箱域名管理（企业版）
+  embedAuthoring: z.boolean().optional(),           // [5] 嵌入编辑功能访问
+  embedAuthoringWhiteLabel: z.boolean().optional(), // [6] 嵌入编辑白标
+  embedSigning: z.boolean().optional(),             // [7] 嵌入签署功能访问
+  embedSigningWhiteLabel: z.boolean().optional(),   // [8] 嵌入签署白标
+  cfr21: z.boolean().optional(),                    // [9] 21 CFR合规
+  hipaa: z.boolean().optional(),                    // [10] HIPAA合规（预留）
+  authenticationPortal: z.boolean().optional(),     // [11] 认证门户（企业版）
+  allowLegacyEnvelopes: z.boolean().optional(),     // [12] 允许旧版信封
+  signingReminders: z.boolean().optional(),         // [13] 签署提醒
 });
 ```
 
-> **重要纠正**：`allowCustomBranding` 是一个元标记flag，实际品牌控制由 `embedSigningWhiteLabel` 和 `embedAuthoringWhiteLabel` 执行。
+> **重要纠正**：
+> 1. 共 **13个** 字段，而非12个（之前计数遗漏了 `allowLegacyEnvelopes`）
+> 2. `allowCustomBranding` 是一个元标记flag，实际品牌控制由 `embedSigningWhiteLabel` 和 `embedAuthoringWhiteLabel` 执行
+
+#### 1.2.1 字段映射一致性说明
+
+`SUBSCRIPTION_CLAIM_FEATURE_FLAGS` 映射表同样包含完整的13个字段（`packages/lib/types/subscription.ts:51-109`）。
+
+⚠️ **已知不一致**：`backport-subscription-claims` Job 的schema仅定义了10个字段，缺少以下3个（代码注释已标记为TODO）：
+- `emailDomains`
+- `authenticationPortal`
+- `allowLegacyEnvelopes`
+
+这意味着通过Job回溯更新档位模板时，上述3个flag不会被批量同步到组织。
 
 ### 1.3 内置档位定义与真实flags配置
 
@@ -487,6 +500,38 @@ PLATFORM档位的配置体现了分层设计：
 
 ---
 
+### 4.5 补充：allowLegacyEnvelopes 检查点
+
+**真实检查点**（前端UI控制）：`apps/remix/app/components/general/folder/folder-grid.tsx:101`
+
+```typescript
+{organisation.organisationClaim.flags.allowLegacyEnvelopes && <DocumentUploadButtonLegacy type={type} />}
+```
+
+**作用**：控制是否显示"旧版文档上传"按钮，用于向下兼容旧版信封功能。
+
+### 4.6 13个功能开关实际使用总览
+
+| 序号 | Flag名称 | 实际执行检查点 | 控制场景 |
+|------|----------|----------------|----------|
+| 1 | `allowCustomBranding` | 管理后台元标记 | UI显示标签，不直接控制执行 |
+| 2 | `hidePoweredBy` | 邮件模板、PDF生成器、签署页面 | 隐藏"Powered by Documenso"标识 |
+| 3 | `unlimitedDocuments` | `getServerLimits()` | 绕过月度文档数量限制 |
+| 4 | `emailDomains` | 未找到实际检查点 | 预留企业版功能 |
+| 5 | `embedAuthoring` | `create-embedding-presign-token.ts` | 嵌入编辑功能入口控制 |
+| 6 | `embedAuthoringWhiteLabel` | `embed/v2/authoring/_layout.tsx` | 嵌入编辑自定义CSS注入 |
+| 7 | `embedSigning` | 签署页面路由 | 嵌入签署功能入口控制 |
+| 8 | `embedSigningWhiteLabel` | `load-recipient-branding.ts` | 收件人签署页自定义品牌 |
+| 9 | `cfr21` | 6个服务端模块 + 8个前端UI | 21 CFR合规认证要求 |
+| 10 | `hipaa` | 未找到实际检查点 | 预留合规标记 |
+| 11 | `authenticationPortal` | 未找到实际检查点 | 预留企业版功能 |
+| 12 | `allowLegacyEnvelopes` | `folder-grid.tsx` | 旧版文档上传按钮显示 |
+| 13 | `signingReminders` | 未找到实际检查点 | 预留功能 |
+
+> **备注**：`emailDomains`、`hipaa`、`authenticationPortal`、`signingReminders` 4个flag已在schema中定义，但暂未找到实际执行检查点，属于预留功能。
+
+---
+
 ## 五、团队功能协作面：额度检查点跨模块映射
 
 ### 5.1 teamCount（团队数量上限）检查点
@@ -860,6 +905,8 @@ Organisation (1)
 3. **额度计算性能**：`getServerLimits()` 每次调用都重新统计当月用量，高频访问下有性能问题
 4. **PLATFORM档位矛盾配置**：`embedAuthoring: false` 但 `embedAuthoringWhiteLabel: true`，设计意图不清晰
 5. **allowCustomBranding名不副实**：flag名称与实际使用不符，易引起误解
+6. **backport job字段不完整**：`backport-subscription-claims` Job schema缺少 `emailDomains`、`authenticationPortal`、`allowLegacyEnvelopes` 3个字段，导致回溯更新时这3个flag无法批量同步
+7. **预留flag无检查点**：`emailDomains`、`hipaa`、`authenticationPortal`、`signingReminders` 4个flag已在schema定义但无实际执行检查点
 
 ### 7.2 优化建议
 
@@ -909,6 +956,35 @@ const getMonthlyUsage = async (organisationId: string) => {
 **建议4：重命名或废弃allowCustomBranding**
 
 将 `allowCustomBranding` 明确为元标记，或统一使用白标flags进行控制，避免混淆。
+
+**建议5：补全backport job schema字段**
+
+在 `packages/lib/jobs/definitions/internal/backport-subscription-claims.ts` 中补充缺失的3个字段：
+
+```typescript
+flags: z.object({
+  unlimitedDocuments: z.literal(true).optional(),
+  allowCustomBranding: z.literal(true).optional(),
+  hidePoweredBy: z.literal(true).optional(),
+  emailDomains: z.literal(true).optional(),           // 补充
+  embedAuthoring: z.literal(true).optional(),
+  embedAuthoringWhiteLabel: z.literal(true).optional(),
+  embedSigning: z.literal(true).optional(),
+  embedSigningWhiteLabel: z.literal(true).optional(),
+  cfr21: z.literal(true).optional(),
+  hipaa: z.literal(true).optional(),
+  authenticationPortal: z.literal(true).optional(),  // 补充
+  allowLegacyEnvelopes: z.literal(true).optional(),  // 补充
+  signingReminders: z.literal(true).optional(),
+}),
+```
+
+**建议6：建立flags完整性检查机制**
+
+在CI/CD中添加校验脚本，确保：
+1. `ZClaimFlagsSchema` 与 `SUBSCRIPTION_CLAIM_FEATURE_FLAGS` 字段一致
+2. `backport-subscription-claims` schema 与 `ZClaimFlagsSchema` 字段一致
+3. 每个flag都有对应的实际检查点（或明确标记为预留）
 
 ---
 

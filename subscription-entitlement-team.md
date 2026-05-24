@@ -517,14 +517,14 @@ PLATFORM档位的配置体现了分层设计：
 | 1 | `allowCustomBranding` | 管理后台元标记 | UI显示标签，不直接控制执行 |
 | 2 | `hidePoweredBy` | 邮件模板、PDF生成器、签署页面 | 隐藏"Powered by Documenso"标识 |
 | 3 | `unlimitedDocuments` | `getServerLimits()` | 绕过月度文档数量限制 |
-| 4 | `emailDomains` | 3个服务端模块 + 6个前端UI | 企业版邮箱域名管理（自定义发件域名） |
+| 4 | `emailDomains` | 3个服务端模块 + 7个前端UI | 企业版邮箱域名管理（自定义发件域名） |
 | 5 | `embedAuthoring` | `create-embedding-presign-token.ts` | 嵌入编辑功能入口控制 |
 | 6 | `embedAuthoringWhiteLabel` | `embed/v2/authoring/_layout.tsx` | 嵌入编辑自定义CSS注入 |
 | 7 | `embedSigning` | 签署页面路由 | 嵌入签署功能入口控制 |
 | 8 | `embedSigningWhiteLabel` | `load-recipient-branding.ts` | 收件人签署页自定义品牌 |
 | 9 | `cfr21` | 6个服务端模块 + 8个前端UI | 21 CFR合规认证要求 |
 | 10 | `hipaa` | 未找到实际检查点 | 预留合规标记 |
-| 11 | `authenticationPortal` | 3个服务端模块 + 3个前端UI | 企业版SSO认证门户 |
+| 11 | `authenticationPortal` | 3个服务端模块 + 4个前端UI | 企业版SSO认证门户 |
 | 12 | `allowLegacyEnvelopes` | `folder-grid.tsx` | 旧版文档上传按钮显示 |
 | 13 | `signingReminders` | 未找到实际检查点 | 预留功能 |
 
@@ -534,7 +534,7 @@ PLATFORM档位的配置体现了分层设计：
 
 **功能**：企业版邮箱域名管理，允许组织配置自定义发件域名、验证域名所有权、管理域名邮箱列表。
 
-**检查点分布在2个服务端模块 + 多个前端UI控制点**：
+**检查点分布在3个服务端模块 + 多个前端UI控制点**：
 
 #### 服务端检查点（共3处）
 
@@ -553,7 +553,7 @@ if (!organisation.organisationClaim.flags.emailDomains) {
 }
 ```
 
-**前端UI控制点**（共6处）：
+**前端UI控制点**（共7处）：
 - `packages/ui/primitives/template-flow/add-template-settings.tsx:463` - 模板设置中的发件邮箱选择
 - `packages/ui/primitives/document-flow/add-subject.tsx:193` - 文档设置中的发件邮箱选择
 - `apps/remix/app/routes/_authenticated+/o.$orgUrl.settings.email-domains._index.tsx:28` - 邮箱域名设置页面入口
@@ -588,7 +588,7 @@ if (
 }
 ```
 
-**前端UI控制点**（共3处）：
+**前端UI控制点**（共4处）：
 - `apps/remix/app/routes/_authenticated+/o.$orgUrl.settings.sso.tsx:66` - SSO设置页面
 - `apps/remix/app/routes/_authenticated+/o.$orgUrl.settings._layout.tsx:103` - 设置菜单隐藏/显示
 - `apps/remix/app/routes/_unauthenticated+/o.$orgUrl.signin.tsx:74` - 组织登录页面SSO按钮显示

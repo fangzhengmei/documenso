@@ -880,27 +880,52 @@ void executeActionAuthProcedure({
     ▼  Step 4: signField catch 捕获（不检查错误码）
     │  envelope-signer-page-renderer.tsx:464-474
     │  1. console.error(err)
-    │  2. toast({ title: 'Error', description: 'An error occurred...' })
-    │  3. throw err  ← 🔴 重新抛出
+    │  2. toast({ title: 'Error', description: 'An error occurred...' })  ← ⚠️ 先显示通用 Toast
+    │  3. throw err  ← 🔴 重新抛出原始错误
     │
     ▼  Step 5: 认证表单 catch 捕获
-    │  document-signing-auth-password.tsx:62-69
+    │  document-signing-auth-password.tsx:62-96
     │
     │  try {
     │    await onReauthFormSubmit({ type: PASSWORD, password });
     │  } catch (err) {
     │    setIsCurrentlyAuthenticating(false);
     │
-    │    const error = AppError.parseError(err);  // ✅ 这里才解析
+    │    const error = AppError.parseError(err);  // ✅ 解析错误
     │    setFormErrorCode(error.code);            // 'UNAUTHORIZED'
-    │    // 不关闭对话框，不 toast（已由 signField 显示过）
+    │    // 注释 "// Todo: Alert." 是过时的，Alert 已实现
     │  }
     │
-    └─ 最终效果：
-       - Toast 显示 "Error: An error occurred while signing the field."
-       - 认证对话框保持打开
-       - 表单错误码设为 'UNAUTHORIZED'（但未显示给用户）
+    ▼  Step 6: 表单渲染时根据 formErrorCode 显示 Alert
+    │  document-signing-auth-password.tsx:87-96
+    │
+    │  {formErrorCode && (
+    │    <Alert variant="destructive">
+    │      <AlertTitle><Trans>Unauthorized</Trans></AlertTitle>
+    │      <AlertDescription>
+    │        <Trans>We were unable to verify your details. Please try again or contact support</Trans>
+    │      </AlertDescription>
+    │    </Alert>
+    │  )}
+    │
+    └─ 最终效果（用户看到两个错误提示）：
+       1. 🔴 Toast 先显示："Error: An error occurred while signing the field."
+          （由 signField catch 无条件显示，包括 UNAUTHORIZED）
+       2. 🟡 Alert 后显示："Unauthorized - We were unable to verify your details..."
+          （由认证表单内根据 formErrorCode 渲染）
+       3. 认证对话框保持打开，用户可重试
 ```
+
+##### 四种认证方式的 Alert 展示代码位置：
+
+| 认证方式 | Alert 展示代码位置 | 已实现 |
+|---------|-------------------|--------|
+| **密码 (PASSWORD)** | `document-signing-auth-password.tsx:87-96` | ✅ |
+| **2FA** | `document-signing-auth-2fa.tsx:177-186` | ✅ |
+| **Passkey** | `document-signing-auth-passkey.tsx:284-293` | ✅ |
+| **Account** | 无 formErrorCode，直接显示登录提示 | ✅ |
+
+> **重要发现**：代码中的 `// Todo: Alert.` 注释（password.tsx:68、2fa.tsx:73、passkey.tsx:98）是过时的，实际上所有认证方式的 Alert 展示都已实现。
 
 ---
 
@@ -953,9 +978,11 @@ static parseError(error: any): AppError {
 |---------|---------|---------|---------|
 | **对话框表单错误** | 对话框内 Zod 校验失败 | `sign-field-email-dialog.tsx:60-63` | 输入框下方红色文字 |
 | **Toast 全局提示** | 后端返回**任何**错误（含 UNAUTHORIZED） | `envelope-signer-page-renderer.tsx:464-474` | 右上角红色 Toast |
-| **认证表单错误码** | 签名字段认证失败，错误被认证对话框 catch | `auth-password.tsx:65-66` | 设置 `formErrorCode`，但未显示给用户 |
+| **认证表单 Alert** | 签名字段认证失败，`formErrorCode` 被设置后重新渲染 | `auth-password.tsx:87-96` | 红色 Alert 显示 "Unauthorized - We were unable to verify your details..." |
 | **字段 Tooltip** | 点击 Complete 时存在未插入字段 | `document-signing-form.tsx:116-120` | 字段旁黄色 Tooltip + 滚动定位 |
 | **字段红色边框** | 提交验证时未插入字段 | `fields.ts:38-40` | 字段边框变红 |
+
+> **修正说明**：之前的结论 "认证错误码未展示给用户" 是错误的。实际上所有认证方式（密码、2FA、Passkey）都已实现了 `{formErrorCode && (<Alert>...</Alert>)}` 的条件渲染，`// Todo: Alert.` 注释是过时的。
 
 ---
 
@@ -996,11 +1023,80 @@ static parseError(error: any): AppError {
 
 | 问题描述 | 代码位置 | 影响 |
 |---------|---------|------|
-| **认证失败时不必要的 Toast** | `envelope-signer-page-renderer.tsx:467-471` | 用户看到 "Error" Toast，造成困惑 |
+| **认证失败时不必要的 Toast** | `envelope-signer-page-renderer.tsx:467-471` | 用户看到两个错误提示：通用 Toast + 认证 Alert，造成困惑 |
 | **缺少 AppError.parseError 调用** | `envelope-signer-page-renderer.tsx:464-474` | 无法区分错误类型进行差异化处理 |
 | **缺少 UNAUTHORIZED 分支处理** | `envelope-signer-page-renderer.tsx:464-474` | 认证错误与其他错误同样处理 |
-| **执行顺序不合理** | `envelope-signer-page-renderer.tsx:464-474` | console.error 在最前，toast 在 throw 之前 |
-| **认证错误码未展示** | `auth-password.tsx:65-66` | `setFormErrorCode(error.code)` 但未显示给用户 |
+| **执行顺序不合理** | `envelope-signer-page-renderer.tsx:464-474` | `console.error → toast → throw`，应先解析错误再决定处理方式 |
+| **过时的 TODO 注释** | `auth-password.tsx:68`<br>`auth-2fa.tsx:73`<br>`auth-passkey.tsx:98` | `// Todo: Alert.` 注释已过时，可能误导后续开发 |
+| **Passkey 未处理 UNAUTHORIZED** | `auth-passkey.tsx:91-93` | `if (err.name === 'NotAllowedError') return` 只处理了 NotAllowedError，其他错误继续执行 |
+
+> **修正说明**：之前的结论 "认证错误码未展示给用户" 已修正。实际上 Alert 显示功能已经实现，问题在于 signField catch 中提前显示了多余的 Toast。
+
+---
+
+### 5.8 formErrorCode 与 signField catch toast 的关系详解
+
+#### 5.8.1 时序关系图
+
+```
+时间轴 →
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                         │
+│  用户输入密码并点击 "Sign"                                                              │
+│         │                                                                                │
+│         ▼                                                                                │
+│  onFormSubmit 执行                                                                       │
+│   ├─ setIsCurrentlyAuthenticating(true)                                                  │
+│   └─ await onReauthFormSubmit({ type: PASSWORD, password })                              │
+│         │                                                                                │
+│         ├─ 内部调用 signField(field.id, payload, authOptions)                           │
+│         │    │                                                                           │
+│         │    ▼ 后端 API 返回 UNAUTHORIZED                                              │
+│         │  signField catch 捕获                                                         │
+│         │   ├─ console.error(err)                 [Step 1, 同步]                        │
+│         │   ├─ toast({ title: 'Error', ... })     [Step 2, 同步]  ← ⚠️ 多余的 Toast    │
+│         │   └─ throw err                         [Step 3, 同步]                        │
+│         │         │                                                                      │
+│         │         ▼                                                                      │
+│         └─ onFormSubmit catch 捕获                                                      │
+│            ├─ setIsCurrentlyAuthenticating(false)                                        │
+│            ├─ const error = AppError.parseError(err)                                    │
+│            └─ setFormErrorCode(error.code)      [Step 4, 同步]                          │
+│                                                                                         │
+│  React 状态更新触发重新渲染                                                                 │
+│   └─ {formErrorCode && (<Alert>...</Alert>)}    [Step 5, 异步渲染]  ← ✅ 正确的 Alert  │
+│                                                                                         │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+                                        ▲
+                                        │
+                                    最终效果：
+                                    1. 先看到 Toast（立即）
+                                    2. 后看到 Alert（React 重渲染后）
+```
+
+#### 5.8.2 两个错误提示的对比
+
+| 维度 | signField catch 中的 Toast | 认证表单中的 Alert |
+|------|---------------------------|-------------------|
+| **触发时机** | 错误抛出后**立即**（同步） | 状态更新后 React**重渲染**（异步） |
+| **显示位置** | 右上角全局 Toast | 认证对话框内表单上方 |
+| **错误消息** | 通用模糊："An error occurred while signing the field." | 精确："Unauthorized - We were unable to verify your details..." |
+| **错误特定性** | 所有错误都显示相同消息 | 仅认证错误显示，且已国际化 |
+| **关闭方式** | 自动超时或手动关闭 | 对话框关闭时自动消失，或下次提交前重置 |
+| **是否必要** | ❌ 对于 UNAUTHORIZED 是多余的 | ✅ 必要，提供精确反馈 |
+
+#### 5.8.3 对用户体验的影响
+
+**当前行为（认证失败时）**：
+1. 用户输入错误密码 → 点击 "Sign"
+2. 立即看到 Toast 弹出："Error - An error occurred while signing the field."
+3. 约几毫秒后，对话框内出现红色 Alert："Unauthorized - We were unable to verify your details..."
+4. 用户看到两个错误提示，可能困惑：到底是字段签名出错了，还是密码不对？
+
+**理想行为（修复后）**：
+1. 用户输入错误密码 → 点击 "Sign"
+2. 对话框内出现红色 Alert："Unauthorized - We were unable to verify your details..."
+3. 没有多余的 Toast，用户明确知道是认证失败
 
 **代码优化建议（V2 signField catch）**：
 
@@ -1024,6 +1120,7 @@ catch (err) {
 catch (err) {
   const error = AppError.parseError(err);
 
+  // UNAUTHORIZED 错误由认证表单处理，不显示通用 Toast
   if (error.code === AppErrorCode.UNAUTHORIZED) {
     throw error;
   }
@@ -1192,15 +1289,18 @@ if (errors.length > 0) {
 | 问题描述 | 位置 | 影响 |
 |---------|------|------|
 | **V2 signField 缺少 AppError.parseError** | `envelope-signer-page-renderer.tsx:464-474` | 无法区分错误类型进行差异化处理 |
-| **V2 signField 缺少 UNAUTHORIZED 检查** | `envelope-signer-page-renderer.tsx:464-474` | 认证失败也会显示通用 Error Toast，用户体验差 |
-| **V2 signField 执行顺序不合理** | `envelope-signer-page-renderer.tsx:464-474` | `console.error → toast → throw`，应先解析错误 |
+| **V2 signField 缺少 UNAUTHORIZED 检查** | `envelope-signer-page-renderer.tsx:464-474` | 认证失败也会显示通用 Error Toast，与 Alert 重复提示 |
+| **V2 signField 执行顺序不合理** | `envelope-signer-page-renderer.tsx:464-474` | `console.error → toast → throw`，应先解析错误再处理 |
 | **V1 路径错误处理不一致** | `sign-field-with-token.ts:131-133` | 使用普通 `Error` 而非 `AppError`，丢失错误码 |
 | **TEXT 校验错误消息错误** | `envelope-signing.ts:131` | 错误消息为 "Invalid email"，应为 "Invalid text" |
 | **INITIALS 返回值 Bug** | `initial-field.ts:43` | 返回 `initials` 而非 `initialsToInsert`，可能导致值不正确 |
-| **认证错误码未展示给用户** | `auth-password.tsx:65-66` | `setFormErrorCode(error.code)` 但未显示 |
+| **过时的 TODO 注释** | `auth-password.tsx:68`<br>`auth-2fa.tsx:73`<br>`auth-passkey.tsx:98` | `// Todo: Alert.` 注释已过时，Alert 已实现，可能误导开发 |
+| **Passkey 未完整处理错误** | `auth-passkey.tsx:91-93` | 仅处理 `NotAllowedError`，其他错误继续执行可能显示双重提示 |
 | **校验逻辑重复** | V1 与 V2 路径 | 状态校验逻辑重复，维护成本高 |
 | **错误消息硬编码** | 所有 validate-*.ts | 校验函数中错误消息为英文硬编码，未使用 i18n |
 | **V1 EMAIL/NAME/INITIALS 无校验** | V1 路径 | 存在数据安全隐患 |
+
+> **修正说明**：已移除 "认证错误码未展示给用户" 的问题，因为代码中所有认证方式（密码、2FA、Passkey）都已实现了 `{formErrorCode && (<Alert>...</Alert>)}` 的条件渲染。问题是 signField catch 中提前显示了多余的 Toast，导致双重提示。
 
 ### 9.3 代码优化建议
 
@@ -1321,22 +1421,65 @@ return [
 ];
 ```
 
-#### 优化点6：认证对话框展示错误码
+#### 优化点6：移除过时的 TODO 注释
 
-**问题**：`setFormErrorCode(error.code)` 但未显示给用户
+**问题**：`// Todo: Alert.` 注释已过时，Alert 显示功能已实现
 
-**优化建议**：在认证对话框中根据错误码显示对应的错误消息。
+**优化建议**：删除三个认证组件中的过时注释，避免误导后续开发。
 
+**优化前** (`auth-password.tsx:68`):
 ```typescript
-// 在 auth-password.tsx 中添加
-{formErrorCode === AppErrorCode.UNAUTHORIZED && (
-  <Alert variant="destructive">
-    <AlertTitle>
-      <Trans>Authentication failed</Trans>
-    </AlertTitle>
-    <AlertDescription>
-      <Trans>The password you entered is incorrect.</Trans>
-    </AlertDescription>
-  </Alert>
-)}
+// Todo: Alert.
+```
+
+**优化后**:
+```typescript
+// 删除过时注释，Alert 显示功能已在第 87-96 行实现
+```
+
+**需修改文件**：
+- `auth-password.tsx:68`
+- `auth-2fa.tsx:73`
+- `auth-passkey.tsx:98`
+
+---
+
+#### 优化点7：Passkey 错误处理完善
+
+**问题**：仅处理 `NotAllowedError`，其他错误继续执行可能显示双重提示
+
+**优化建议**：在 Passkey 认证组件中完整处理 UNAUTHORIZED 错误。
+
+**优化前** (`auth-passkey.tsx:88-99`):
+```typescript
+catch (err) {
+  setIsCurrentlyAuthenticating(false);
+
+  if (err.name === 'NotAllowedError') {
+    return;
+  }
+
+  const error = AppError.parseError(err);
+  setFormErrorCode(error.code);
+
+  // Todo: Alert.
+}
+```
+
+**优化后**:
+```typescript
+catch (err) {
+  setIsCurrentlyAuthenticating(false);
+
+  if (err.name === 'NotAllowedError') {
+    return;
+  }
+
+  const error = AppError.parseError(err);
+  
+  // UNAUTHORIZED 错误由认证表单 Alert 处理，不重复处理
+  if (error.code !== AppErrorCode.UNAUTHORIZED) {
+    setFormErrorCode(error.code);
+  }
+}
 ```

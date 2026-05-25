@@ -488,6 +488,176 @@ if (pendingRecipients.length > 0) {
 | "同号时按 id 排序" | ✅ 正确 | 排序规则为 `signingOrder ASC, id ASC` |
 | "并行签署所有人同时收到通知" | ✅ 正确 | 并行模式下所有非 CC 同时收到通知 |
 
+#### 2.3.1.7 同号 signingOrder 场景深度分析
+
+**同号产生路径**：
+1. **UI 拖拽**：前端 `normalizeSigningOrders` 会重新分配 `index + 1`，确保唯一
+2. **API 直接调用**：`update-envelope-recipients.ts` 直接保存 `signingOrder`，不做归一化
+3. **模板创建**：直接写入数据库时可设置相同值
+
+**UI 侧与后端的一致性分析**：
+
+| 层面 | UI 行为 | 后端行为 | 是否一致 |
+|-----|--------|---------|---------|
+| **拖拽排序** | `normalizeSigningOrders` 重新分配 `index + 1` | 直接保存，不做归一化 | ❌ 不一致 |
+| **API 保存** | 直接发送当前值 | 直接保存 | ✅ 一致 |
+| **发送通知排序** | N/A | `signingOrder ASC, id ASC` | N/A |
+| **取下一位排序** | N/A | `signingOrder ASC, id ASC` | N/A |
+
+**关键发现：UI 与后端存在不一致！**
+
+```typescript
+// UI 端：拖拽时强制归一化
+// add-signers.tsx:358-361
+const updatedSigners = items.map((signer, index) => ({
+  ...signer,
+  signingOrder: !canRecipientBeModified(signer.nativeId) 
+    ? signer.signingOrder 
+    : index + 1,  // ← 强制重新分配，确保唯一
+}));
+
+// UI 端：删除时也归一化
+// add-signers.tsx:169-173
+const normalizeSigningOrders = (signers) => {
+  return signers
+    .sort((a, b) => (a.signingOrder ?? 0) - (b.signingOrder ?? 0))
+    .map((signer, index) => ({ ...signer, signingOrder: index + 1 }));  // ← 强制重新分配
+};
+
+// 后端：直接保存，不做归一化
+// update-envelope-recipients.ts:134
+data: {
+  signingOrder: mergedRecipient.signingOrder,  // ← 直接保存用户提供的值
+}
+```
+
+**同号 + 不同 id 条件下的实际执行顺序**：
+
+| 环节 | 排序规则 | 代码位置 | 同号时的行为 |
+|-----|---------|---------|-------------|
+| **通知选择** | `signingOrder ASC, id ASC` | `send-document.ts:64` | 取 `slice(0, 1)` → id 最小的先收到通知 |
+| **下一位激活** | `signingOrder ASC, id ASC` | `complete-document-with-token.ts:388` | 取 `pendingRecipients[0]` → id 最小的先被激活 |
+| **turn 判定** | `signingOrder ASC`（**只有单列排序！**） | `get-is-recipient-turn.ts:21-23` | ⚠️ 同号时顺序不确定 |
+
+**⚠️ 重要风险：turn 判定缺少 id 排序**
+
+```typescript
+// get-is-recipient-turn.ts:20-23
+include: {
+  documentMeta: true,
+  recipients: {
+    orderBy: {
+      signingOrder: 'asc',  // ← 只有单列排序！没有 id: 'asc'
+    },
+  },
+},
+```
+
+**风险说明**：
+- 当多个收件人有相同 signingOrder 时，`getIsRecipientsTurnToSign` 返回的收件人顺序不确定
+- 但 `sendDocument` 和 `completeDocumentWithToken` 使用 `signingOrder ASC, id ASC`
+- 这可能导致：通知给了 id=1 的收件人，但 turn 判定认为 id=2 的收件人应该先签
+- **实际影响**：在正常 UI 流程中不会出现（因为 UI 会归一化），但通过 API 直接设置同号时可能触发
+
+**可复现的同号场景实例**：
+
+```
+配置（通过 API 直接设置）：
+  - Recipient A: signingOrder=1, id=1, role=SIGNER
+  - Recipient B: signingOrder=1, id=2, role=SIGNER  ← 同号！
+
+执行流程：
+1. send-document.ts:64
+   排序结果：[A(id=1), B(id=2)]
+   通知：A 收到通知（slice(0, 1)）
+
+2. A 完成签署
+   complete-document-with-token.ts:388
+   排序结果：[B(id=2)]
+   激活：B 收到通知
+
+3. B 尝试签署
+   get-is-recipient-turn.ts:21-23
+   排序结果：[A(id=1), B(id=2)] 或 [B(id=2), A(id=1)] ⚠️ 不确定！
+   - 如果返回 [A, B]：B 的 index=1，前面的 A 已 SIGNED → 返回 true ✅
+   - 如果返回 [B, A]：B 的 index=0，前面没有 → 返回 true ✅
+   
+   结论：在这个场景下，两种排序结果都会返回 true，因为 A 已 SIGNED
+```
+
+**同号阻塞场景**：
+
+```
+配置（通过 API 直接设置）：
+  - Recipient A: signingOrder=1, id=1, role=SIGNER, status=NOT_SIGNED
+  - Recipient B: signingOrder=1, id=2, role=SIGNER, status=NOT_SIGNED
+
+B 尝试签署：
+  get-is-recipient-turn.ts:21-23
+  排序结果不确定：
+  - [A, B]：B 的 index=1，A 未 SIGNED → 返回 false ❌（B 被阻塞）
+  - [B, A]：B 的 index=0，前面没有 → 返回 true ✅（B 可签署）
+  
+  结论：同号时，B 是否能签署取决于数据库返回顺序，行为不确定！
+```
+
+**完整流程链路（同号 + 不同 id）**：
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  1. 配置 signingOrder                                             │
+│     ├─ UI 拖拽：normalizeSigningOrders 确保唯一                   │
+│     └─ API 直接调用：可能设置同号（无归一化）                       │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  2. 发送文档通知（send-document.ts:64, 102-106）                  │
+│     排序规则：signingOrder ASC, id ASC                            │
+│     ├─ 同号时按 id 升序                                           │
+│     └─ 取 slice(0, 1) → id 最小的先收到通知                       │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  3. 收件人完成动作                                                │
+│     complete-document-with-token.ts:107-114                       │
+│     ├─ 调用 getIsRecipientsTurnToSign 验证轮到                    │
+│     └─ 如果不是轮到，抛出错误                                     │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  4. turn 判定（get-is-recipient-turn.ts:21-23）                   │
+│     排序规则：signingOrder ASC（⚠️ 缺少 id ASC）                   │
+│     ├─ 同号时顺序不确定（依赖数据库返回）                         │
+│     └─ 检查前面所有收件人是否都为 SIGNED                          │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  5. 查找下一个待处理收件人                                        │
+│     complete-document-with-token.ts:386-389                       │
+│     排序规则：signingOrder ASC, id ASC                            │
+│     ├─ 同号时按 id 升序                                           │
+│     └─ 取 pendingRecipients[0] → id 最小的下一个                  │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  6. 通知下一个收件人                                              │
+│     complete-document-with-token.ts:394-454                       │
+│     发送签署请求邮件给 nextRecipient                               │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**机制结论（不含矛盾）**：
+
+| 结论 | 说明 |
+|-----|------|
+| UI 流程安全 | 前端拖拽排序会强制归一化，不会产生同号 |
+| API 流程有风险 | 通过 API 直接设置同号时，turn 判定可能与通知顺序不一致 |
+| 根因 | `get-is-recipient-turn.ts:21-23` 缺少 `id: 'asc'` 作为第二排序键 |
+| 建议修复 | 将 turn 判定的 orderBy 改为 `[{ signingOrder: 'asc' }, { id: 'asc' }]` |
+| 临时规避 | 确保通过 UI 配置顺序，或 API 设置唯一的 signingOrder |
+
+**风险等级**：中（仅在 API 直接设置同号时触发，UI 流程安全）
+
 ### 2.4 轮到签署判定逻辑
 
 **文件位置**：`packages/lib/server-only/recipient/get-is-recipient-turn.ts:8-47`
@@ -933,7 +1103,7 @@ await tx.documentAuditLog.create({
 | 字段需求判定 | `packages/lib/utils/recipients.ts:16-38` | 只有 SIGNER 强制要求签名字段 |
 | 修改权限判定 | `packages/lib/utils/recipients.ts:45-87` | VIEWER/CC 不可修改字段 |
 | 必填字段判定 | `packages/lib/utils/advanced-fields-helpers.ts:18-39` | 签名字段始终必填 |
-| 轮到签署判定 | `packages/lib/server-only/recipient/get-is-recipient-turn.ts` | 顺序签署检查前面是否都 SIGNED |
+| 轮到签署判定 | `packages/lib/server-only/recipient/get-is-recipient-turn.ts:21-23` | ⚠️ 排序只有 `signingOrder ASC`，缺少 `id ASC` |
 | 下一个收件人 | `packages/lib/server-only/recipient/get-next-pending-recipient.ts` | 取排序后下一个 |
 | 完成签署逻辑 | `packages/lib/server-only/document/complete-document-with-token.ts` | 状态更新+流程推进 |
 | 发送文档逻辑 | `packages/lib/server-only/document/send-document.ts` | 逐人放行：`slice(0,1)` |
@@ -947,6 +1117,8 @@ await tx.documentAuditLog.create({
 | 前端签署表单 | `apps/remix/app/components/general/envelope-signing/envelope-signer-form.tsx:37-129` | VIEWER 不显示表单 |
 | 完成页面标题 | `apps/remix/app/routes/_recipient+/sign.$token+/complete.tsx:184-188` | 按角色显示不同标题 |
 | 拖拽排序重排 | `packages/ui/primitives/document-flow/add-signers.tsx:358-361` | 强制重新分配 `index + 1` |
+| 删除时归一化 | `packages/ui/primitives/document-flow/add-signers.tsx:169-173` | `normalizeSigningOrders` 重新分配 |
+| 后端保存 signingOrder | `packages/lib/server-only/recipient/update-envelope-recipients.ts:134` | ⚠️ 直接保存，不做归一化 |
 | 官方文档说明 | `apps/docs/content/docs/users/documents/add-recipients.mdx:95` | VIEWER 用作见证人 |
 
 ---
@@ -1255,6 +1427,14 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 2. [ ] 检查 `send-document.ts:102-106`：顺序签署只通知 `slice(0, 1)` 第一个收件人
 3. [ ] 检查 `complete-document-with-token.ts:395`：取 `pendingRecipients[0]` 作为下一个
 4. [ ] 结论：不存在"同号并行"，实际是严格的"逐人放行"
+
+#### ✅ 验证同号 signingOrder 风险（新增）
+1. [ ] 检查 `add-signers.tsx:169-173`：`normalizeSigningOrders` 会重新分配 `index + 1`
+2. [ ] 检查 `update-envelope-recipients.ts:134`：后端直接保存 `signingOrder`，不做归一化
+3. [ ] 检查 `send-document.ts:64`：排序规则为 `signingOrder ASC, id ASC`
+4. [ ] 检查 `complete-document-with-token.ts:388`：排序规则为 `signingOrder ASC, id ASC`
+5. [ ] 检查 `get-is-recipient-turn.ts:21-23`：⚠️ 排序规则只有 `signingOrder ASC`，缺少 `id ASC`
+6. [ ] 结论：turn 判定缺少 id 排序，同号时可能与通知顺序不一致
 
 #### ✅ 验证流程推进逻辑
 1. [ ] 并行签署：所有非 CC 同时收到通知：`send-document.ts:100-111`

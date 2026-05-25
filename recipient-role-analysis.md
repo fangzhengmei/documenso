@@ -66,7 +66,7 @@ export const RECIPIENT_ROLE_SIGNING_REASONS = {
 }
 ```
 
-### 1.3 角色字段需求判定
+### 1.3 角色字段需求判定（修正版）
 
 **文件位置**：`packages/lib/utils/recipients.ts:16-38`
 
@@ -86,24 +86,44 @@ export const getRecipientsWithMissingFields = (recipients, fields) => {
 };
 ```
 
-**关键差异**：
-| 角色 | 签名字段 | 其他字段 | 发送前验证 |
-|------|---------|---------|-----------|
-| SIGNER | ✅ 必须至少1个 | 可选 | 验证签名字段存在 |
-| APPROVER | ❌ 不需要 | 可选 | 不验证 |
-| VIEWER | ❌ 不需要 | 不可分配 | 不验证 |
-| CC | ❌ 不需要 | 不可分配 | 不验证 |
-| ASSISTANT | ❌ 不需要 | 可选（预填） | 不验证 |
+#### 1.3.1 三层职责边界：前端UI选择 vs 字段拖拽分配 vs 服务端校验
 
-**前端字段分配过滤**：
+| 职责层面 | 代码位置 | SIGNER | APPROVER | VIEWER | CC | ASSISTANT |
+|---------|---------|--------|----------|--------|-----|-----------|
+| **① 前端可选角色**（字段分配下拉框） | `recipient-selector.tsx:53-54` | ✅ 可选 | ✅ 可选 | ❌ 过滤 | ❌ 过滤 | ❌ 过滤 |
+| **② 字段拖拽分配**（PDF上拖放字段） | `add-template-fields.tsx:471-473` | ✅ 可分配所有类型 | ✅ 可分配所有类型 | ❌ 不可分配 | ❌ 不可分配 | ❌ 不可分配 |
+| **③ 服务端必填校验**（发送前验证） | `recipients.ts:28-37` | ✅ 必须有签名字段 | ❌ 无强制要求 | ❌ 无强制要求 | ❌ 无强制要求 | ❌ 无强制要求 |
+
+**关键结论修正**：
+- ❌ **APPROVER 不是"不需要签名字段"，而是"可以有但不强制"**
+- ✅ **APPROVER 在前端UI中可以分配签名字段**（下拉框和拖拽都允许）
+- ✅ **APPROVER 在服务端校验中不要求必须有签名字段**（与 SIGNER 的核心差异）
+- ✅ **VIEWER 在前端UI中被过滤，完全不能分配任何字段**
+
+#### 1.3.2 前端字段分配过滤代码分析
+
 ```typescript
-// packages/ui/primitives/template-flow/add-template-fields.tsx:471-472
+// packages/ui/primitives/template-flow/add-template-fields.tsx:471-473
 // packages/ui/primitives/recipient-selector.tsx:53-54
 return (Object.entries(recipientsByRole) as [RecipientRole, TRecipientLite[]][]).filter(
   ([role]) => role !== RecipientRole.CC && role !== RecipientRole.VIEWER && role !== RecipientRole.ASSISTANT,
 );
 ```
-→ **VIEWER 在字段分配UI中被过滤，不能分配任何字段**
+
+**过滤逻辑解析**：
+- 排除 `CC`：抄送人不需要操作
+- 排除 `VIEWER`：查看人/见证人只需查看，不需要填写字段
+- 排除 `ASSISTANT`：助手只能预填，不在此下拉框中选择
+- **保留 `SIGNER` 和 `APPROVER`**：两者都可以被分配字段
+
+**修正后的字段分配矩阵**：
+| 角色 | 签名字段 | 其他字段 | 发送前验证 | 说明 |
+|------|---------|---------|-----------|------|
+| SIGNER | ✅ 必须至少1个 | 可选 | 验证签名字段存在 | 唯一有强制校验的角色 |
+| APPROVER | ✅ 可分配（非必须） | 可选 | 不验证 | 可以有签名字段，但不强制 |
+| VIEWER | ❌ 不可分配 | ❌ 不可分配 | 不验证 | 前端UI完全过滤 |
+| CC | ❌ 不可分配 | ❌ 不可分配 | 不验证 | 前端UI完全过滤 |
+| ASSISTANT | ❌ 不可分配 | ❌ 不可分配 | 不验证 | 前端UI完全过滤 |
 
 ### 1.4 前端签署表单的角色区分
 
@@ -317,6 +337,156 @@ enum DocumentSigningOrder {
 - 三种角色在通知顺序上完全平等，只由 `signingOrder` 决定
 - 三种角色在轮到判定上完全平等，都能阻塞后续流程
 - 只有 CC 角色被排除在通知和流程之外
+
+### 2.3.1 签署顺序机制修正：不存在"同号并行"，实际为"逐人放行"
+
+**重要修正**：文档描述中可能存在的"相同 signingOrder 的收件人并行签署"是一个**不存在的特性**。实际实现是严格的"逐人放行"。
+
+#### 2.3.1.1 三层证据链
+
+| 证据层面 | 代码位置 | 实际行为 |
+|---------|---------|---------|
+| **① 前端拖拽排序** | `add-signers.tsx:358-361` | 拖拽后强制重新分配 `index + 1`，确保所有 signingOrder 唯一 |
+| **② 发送文档通知** | `send-document.ts:102-106` | 顺序签署时只通知第一个 NOT_SIGNED 且非 CC 的收件人 |
+| **③ 完成后取下一个** | `complete-document-with-token.ts:395` | 取 `pendingRecipients[0]`，即排序后第一个待处理收件人 |
+
+#### 2.3.1.2 前端拖拽排序的顺序重排逻辑
+
+```typescript
+// packages/ui/primitives/document-flow/add-signers.tsx:358-361
+const updatedSigners = items.map((signer, index) => ({
+  ...signer,
+  signingOrder: !canRecipientBeModified(signer.nativeId) ? signer.signingOrder : index + 1,
+}));
+```
+
+**关键逻辑**：
+- 拖拽完成后，所有可修改的收件人会被重新分配 `index + 1` 作为 signingOrder
+- 这意味着**前端 UI 强制所有 signingOrder 是连续的、唯一的整数**
+- 即使数据库中存在相同 signingOrder，也会在下次编辑时被重新分配
+
+#### 2.3.1.3 发送文档时的逐人放行机制
+
+```typescript
+// packages/lib/server-only/document/send-document.ts:102-111
+if (signingOrder === DocumentSigningOrder.SEQUENTIAL) {
+  // Get the currently active recipient.
+  recipientsToNotify = envelope.recipients
+    .filter((r) => r.signingStatus === SigningStatus.NOT_SIGNED && r.role !== RecipientRole.CC)
+    .slice(0, 1);  // ← 只取第一个
+
+  // Secondary filter so we aren't resending if the current active recipient has already
+  // received the envelope.
+  recipientsToNotify.filter((r) => r.sendStatus !== SendStatus.SENT);
+}
+```
+
+**关键逻辑**：
+- 顺序签署时，只取第一个满足条件的收件人发送通知
+- 条件：`NOT_SIGNED` 且 `role !== CC`
+- 排序依据：`signingOrder ASC, id ASC`
+- **即使多个收件人有相同 signingOrder，也只会通知第一个**
+
+#### 2.3.1.4 完成后取下一个收件人
+
+```typescript
+// packages/lib/server-only/document/complete-document-with-token.ts:369-395
+const pendingRecipients = await prisma.recipient.findMany({
+  where: {
+    envelopeId: envelope.id,
+    signingStatus: { not: SigningStatus.SIGNED },
+    role: { not: RecipientRole.CC },
+  },
+  orderBy: [{ signingOrder: { sort: 'asc', nulls: 'last' } }, { id: 'asc' }],
+});
+
+if (pendingRecipients.length > 0) {
+  if (envelope.documentMeta?.signingOrder === DocumentSigningOrder.SEQUENTIAL) {
+    const [nextRecipient] = pendingRecipients;  // ← 取排序后第一个
+    // ... 发送通知给 nextRecipient
+  }
+}
+```
+
+**关键逻辑**：
+- 排序规则：`signingOrder ASC, id ASC`
+- 取 `pendingRecipients[0]` 作为下一个收件人
+- **即使多个收件人有相同 signingOrder，也只会通知 id 最小的那个**
+
+#### 2.3.1.5 完整流程链路：从配置到通知再到 turn 判定
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  步骤1：配置 signingOrder（前端）                                 │
+├───────────────────────────────────────────────────────────────────┤
+│  用户在 UI 中拖拽排序收件人                                        │
+│      ↓                                                           │
+│  add-signers.tsx:358-361                                         │
+│  强制重新分配 index + 1                                           │
+│      ↓                                                           │
+│  保存到数据库：所有 signingOrder 唯一且连续                         │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  步骤2：发送文档通知                                              │
+├───────────────────────────────────────────────────────────────────┤
+│  send-document.ts:102-106                                        │
+│      ↓                                                           │
+│  顺序签署模式：                                                   │
+│  ├─ 过滤：NOT_SIGNED 且 非 CC                                    │
+│  ├─ 排序：signingOrder ASC, id ASC                               │
+│  ├─ 取 slice(0, 1) → 只通知第一个                                │
+│  └─ 后续收件人等待                                               │
+│                                                                   │
+│  并行签署模式：                                                   │
+│  ├─ 所有非 CC 收件人同时收到通知                                  │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  步骤3：收件人完成动作                                            │
+├───────────────────────────────────────────────────────────────────┤
+│  complete-document-with-token.ts:279-290                          │
+│      ↓                                                           │
+│  更新当前收件人状态为 SIGNED                                      │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  步骤4：查找下一个待处理收件人                                     │
+├───────────────────────────────────────────────────────────────────┤
+│  complete-document-with-token.ts:369-389                          │
+│      ↓                                                           │
+│  过滤：signingStatus != SIGNED 且 role != CC                      │
+│  排序：signingOrder ASC, id ASC                                   │
+│  取 pendingRecipients[0] → 下一个收件人                           │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  步骤5：通知下一个收件人（顺序签署时）                              │
+├───────────────────────────────────────────────────────────────────┤
+│  complete-document-with-token.ts:394-454                          │
+│      ↓                                                           │
+│  发送签署请求邮件给 nextRecipient                                 │
+└───────────────────────────────────────────────────────────────────┘
+    ↓
+┌───────────────────────────────────────────────────────────────────┐
+│  步骤6：轮到判定（收件人打开签署页面时）                            │
+├───────────────────────────────────────────────────────────────────┤
+│  get-is-recipient-turn.ts:40-44                                   │
+│      ↓                                                           │
+│  检查前面所有收件人是否都为 SIGNED                                │
+│  ├─ 全部 SIGNED → 返回 true（可以签署）                           │
+│  └─ 存在 NOT_SIGNED → 返回 false（等待中）                        │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+#### 2.3.1.6 修正后的签署顺序结论
+
+| 描述 | 是否正确 | 说明 |
+|-----|---------|------|
+| "相同 signingOrder 的收件人并行签署" | ❌ 错误 | 前端拖拽会强制重新分配唯一的 signingOrder |
+| "顺序签署按 signingOrder 依次进行" | ✅ 正确 | 发送时只通知第一个，完成后取下一个 |
+| "同号时按 id 排序" | ✅ 正确 | 排序规则为 `signingOrder ASC, id ASC` |
+| "并行签署所有人同时收到通知" | ✅ 正确 | 并行模式下所有非 CC 同时收到通知 |
 
 ### 2.4 轮到签署判定逻辑
 
@@ -754,26 +924,30 @@ await tx.documentAuditLog.create({
 
 ---
 
-## 7. 关键代码位置汇总
+## 7. 关键代码位置汇总（修正版）
 
-| 功能 | 文件路径 |
-|------|---------|
-| 角色枚举定义 | `packages/prisma/schema.prisma:573-579` |
-| 角色描述配置 | `packages/lib/constants/recipient-roles.ts` |
-| 字段需求判定 | `packages/lib/utils/recipients.ts:16-38` |
-| 修改权限判定 | `packages/lib/utils/recipients.ts:45-87` |
-| 必填字段判定 | `packages/lib/utils/advanced-fields-helpers.ts:18-39` |
-| 轮到签署判定 | `packages/lib/server-only/recipient/get-is-recipient-turn.ts` |
-| 下一个收件人 | `packages/lib/server-only/recipient/get-next-pending-recipient.ts` |
-| 完成签署逻辑 | `packages/lib/server-only/document/complete-document-with-token.ts` |
-| 发送文档逻辑 | `packages/lib/server-only/document/send-document.ts` |
-| 签署字段逻辑 | `packages/lib/server-only/field/sign-field-with-token.ts` |
-| 获取签署信封 | `packages/lib/server-only/envelope/get-envelope-for-recipient-signing.ts` |
-| 发送邮件逻辑 | `packages/lib/jobs/definitions/emails/send-signing-email.handler.ts` |
-| 角色选择UI | `packages/ui/components/recipient/recipient-role-select.tsx` |
-| 角色图标定义 | `packages/ui/primitives/recipient-role-icons.tsx` |
-| 字段分配UI过滤 | `packages/ui/primitives/recipient-selector.tsx:53-54` |
-| 官方文档说明 | `apps/docs/content/docs/users/documents/add-recipients.mdx:95` |
+| 功能 | 文件路径 | 说明 |
+|------|---------|------|
+| 角色枚举定义 | `packages/prisma/schema.prisma:573-579` | SIGNER/VIEWER/APPROVER/CC/ASSISTANT |
+| 角色描述配置 | `packages/lib/constants/recipient-roles.ts` | 动作动词、邮件类型、签署理由 |
+| 字段需求判定 | `packages/lib/utils/recipients.ts:16-38` | 只有 SIGNER 强制要求签名字段 |
+| 修改权限判定 | `packages/lib/utils/recipients.ts:45-87` | VIEWER/CC 不可修改字段 |
+| 必填字段判定 | `packages/lib/utils/advanced-fields-helpers.ts:18-39` | 签名字段始终必填 |
+| 轮到签署判定 | `packages/lib/server-only/recipient/get-is-recipient-turn.ts` | 顺序签署检查前面是否都 SIGNED |
+| 下一个收件人 | `packages/lib/server-only/recipient/get-next-pending-recipient.ts` | 取排序后下一个 |
+| 完成签署逻辑 | `packages/lib/server-only/document/complete-document-with-token.ts` | 状态更新+流程推进 |
+| 发送文档逻辑 | `packages/lib/server-only/document/send-document.ts` | 逐人放行：`slice(0,1)` |
+| 签署字段逻辑 | `packages/lib/server-only/field/sign-field-with-token.ts` | 助手可替他人填写 |
+| 获取签署信封 | `packages/lib/server-only/envelope/get-envelope-for-recipient-signing.ts` | 签署页面数据 |
+| 发送邮件逻辑 | `packages/lib/jobs/definitions/emails/send-signing-email.handler.ts` | 排除 CC，按角色发邮件 |
+| 角色选择UI | `packages/ui/components/recipient/recipient-role-select.tsx` | 下拉框选择角色 |
+| 角色图标定义 | `packages/ui/primitives/recipient-role-icons.tsx` | 角色对应的图标 |
+| 字段分配UI过滤 | `packages/ui/primitives/recipient-selector.tsx:53-54` | 过滤 CC/VIEWER/ASSISTANT |
+| 字段拖拽分配过滤 | `packages/ui/primitives/template-flow/add-template-fields.tsx:471-473` | 过滤 CC/VIEWER/ASSISTANT |
+| 前端签署表单 | `apps/remix/app/components/general/envelope-signing/envelope-signer-form.tsx:37-129` | VIEWER 不显示表单 |
+| 完成页面标题 | `apps/remix/app/routes/_recipient+/sign.$token+/complete.tsx:184-188` | 按角色显示不同标题 |
+| 拖拽排序重排 | `packages/ui/primitives/document-flow/add-signers.tsx:358-361` | 强制重新分配 `index + 1` |
+| 官方文档说明 | `apps/docs/content/docs/users/documents/add-recipients.mdx:95` | VIEWER 用作见证人 |
 
 ---
 
@@ -787,11 +961,12 @@ await tx.documentAuditLog.create({
 - 都设置过期时间
 - 都接收签署通知邮件
 
-**不同点**：
+**不同点**（修正版）：
 | 对比项 | SIGNER | APPROVER |
 |--------|--------|----------|
-| 签名字段 | ✅ 必须有 | ❌ 不需要 |
-| 字段分配 | 可分配所有类型 | 不能分配签名字段 |
+| 签名字段 | ✅ **必须有**（服务端强制校验） | ✅ **可分配（非必须）**（前端允许，服务端不强制） |
+| 字段分配 | 可分配所有类型 | 可分配所有类型（前端UI允许） |
+| 服务端校验 | 验证必须有签名字段 | 无强制校验 |
 | 邮件类型 | SIGNING_REQUEST | APPROVE_REQUEST |
 | 显示类型 | SIGNING_REQUEST | APPROVE_REQUEST |
 | 动作动词 | Sign | Approve |
@@ -808,11 +983,23 @@ if (recipient.role === RecipientRole.SIGNER) {
   return !hasSignatureField;
 }
 
-// 2. 邮件类型区分
+// 2. 前端字段分配：保留 SIGNER 和 APPROVER，过滤 CC/VIEWER/ASSISTANT
+// packages/ui/primitives/recipient-selector.tsx:53-54
+.filter(([role]) => role !== RecipientRole.CC 
+  && role !== RecipientRole.VIEWER 
+  && role !== RecipientRole.ASSISTANT)
+
+// 3. 邮件类型区分
 // packages/lib/constants/recipient-roles.ts:124-128
 [RecipientRole.SIGNER]: `SIGNING_REQUEST`,
 [RecipientRole.APPROVER]: `APPROVE_REQUEST`,
 ```
+
+**关键修正说明**：
+- ❌ 原结论"APPROVER 不能分配签名字段"是错误的
+- ✅ APPROVER 在前端UI中可以分配所有类型字段（包括签名字段）
+- ✅ 只有 SIGNER 在服务端被强制要求必须有签名字段
+- ✅ APPROVER 有签名字段是可选的，不是必须的
 
 ### 8.2 查看人/见证人 (VIEWER) vs 抄送人 (CC)
 
@@ -1000,7 +1187,7 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 
 ## 11. 完整可核实流程总结
 
-### 11.1 三角色端到端流程对比表
+### 11.1 三角色端到端流程对比表（修正版）
 
 | 流程阶段 | 判定点 | SIGNER | APPROVER | VIEWER (见证人) | 代码验证位置 |
 |---------|-------|--------|----------|----------------|-------------|
@@ -1008,10 +1195,12 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 | | 动作动词 | Sign | Approve | View | recipient-roles.ts:5-137 |
 | | 邮件类型 | `SIGNING_REQUEST` | `APPROVE_REQUEST` | `VIEW_REQUEST` | recipient-roles.ts:124-129 |
 | | 签署理由 | "I am a signer" | "I am an approver" | "I am a viewer" | recipient-roles.ts:131-137 |
-| **2. 发送前校验** | 签名字段要求 | ✅ 必须有 | ❌ 不需要 | ❌ 不需要 | recipients.ts:28-33 |
-| | 字段分配UI | ✅ 可分配所有 | ✅ 除签名外 | ❌ 被过滤 | recipient-selector.tsx:53-54 |
+| **2. 发送前校验** | 签名字段要求 | ✅ **必须有** | ✅ **可分配（非必须）** | ❌ **不可分配** | recipients.ts:28-33 |
+| | 前端可选角色 | ✅ 可选 | ✅ 可选 | ❌ 过滤 | recipient-selector.tsx:53-54 |
+| | 字段拖拽分配 | ✅ 可分配所有类型 | ✅ 可分配所有类型 | ❌ 不可分配 | add-template-fields.tsx:471-473 |
+| | 服务端强制校验 | ✅ 验证签名字段存在 | ❌ 无强制要求 | ❌ 无强制要求 | recipients.ts:28-37 |
 | **3. 发送通知** | 并行签署 | 同时收到 | 同时收到 | 同时收到 | send-document.ts:100-111 |
-| | 顺序签署 | 按 order 依次 | 按 order 依次 | 按 order 依次 | send-document.ts:100-111 |
+| | 顺序签署 | 逐人放行 | 逐人放行 | 逐人放行 | send-document.ts:102-106 |
 | | 邮件主题 | "Please sign..." | "Please approve..." | "Please view..." | send-signing-email.handler.ts:105-108 |
 | | 设置过期 | ✅ | ✅ | ✅ | send-document.ts:258-260 |
 | **4. 轮到判定** | 顺序签署检查 | 检查前面所有 | 检查前面所有 | 检查前面所有 | get-is-recipient-turn.ts:40-44 |
@@ -1022,12 +1211,18 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 | | 状态更新 | `SIGNED` | `SIGNED` | `SIGNED` | complete-document-with-token.ts:285 |
 | | 审计日志 | 记录 role | 记录 role | 记录 role | complete-document-with-token.ts:342 |
 | **7. 流程推进** | 待处理收件人 | 包含 | 包含 | 包含 | complete-document-with-token.ts:382-384 |
-| | 触发下一个 | ✅ | ✅ | ✅ | complete-document-with-token.ts:394-454 |
+| | 触发下一个 | ✅ 逐人放行 | ✅ 逐人放行 | ✅ 逐人放行 | complete-document-with-token.ts:394-454 |
 | **8. 文档完成** | 个人完成条件 | 字段完成+SIGNED | 字段完成+SIGNED | 只需 SIGNED | 见 3.2.1 节 |
 | | 文档完成条件 | 需 SIGNED | 需 SIGNED | 需 SIGNED | complete-document-with-token.ts:462-463 |
 | | 完成页面标题 | Document Signed | Document Approved | Document Viewed | complete.tsx:184-188 |
 
-### 11.2 可核实的代码检查清单
+**关键修正点**：
+- ❌ APPROVER 不是"不需要签名字段"，而是"可以有但不强制"
+- ✅ APPROVER 在前端UI中可以分配签名字段（下拉框和拖拽都允许）
+- ❌ 不存在"同号并行"，顺序签署实际是"逐人放行"
+- ✅ 前端拖拽排序会强制重新分配唯一的 signingOrder
+
+### 11.2 可核实的代码检查清单（修正版）
 
 要验证三角色流程的正确性，可以按以下清单检查代码：
 
@@ -1036,6 +1231,12 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 2. [ ] 检查 `recipient-roles.ts:72-93` 中 VIEWER 的动作动词为 "View"
 3. [ ] 检查 `recipient-selector.tsx:53-54` 中 VIEWER 在字段分配UI中被过滤
 4. [ ] 检查 `envelope-signer-form.tsx:37-39` 中 VIEWER 不显示任何表单
+
+#### ✅ 验证 APPROVER 字段分配（修正）
+1. [ ] 检查 `recipient-selector.tsx:53-54`：APPROVER 不在过滤列表中（可选择）
+2. [ ] 检查 `add-template-fields.tsx:471-473`：APPROVER 不在过滤列表中（可拖拽分配）
+3. [ ] 检查 `recipients.ts:28-37`：只有 SIGNER 被验证必须有签名字段
+4. [ ] 结论：APPROVER 可以分配签名字段，但不强制要求
 
 #### ✅ 验证角色分流逻辑
 1. [ ] 发送前只验证 SIGNER 的签名字段：`recipients.ts:28-33`
@@ -1048,6 +1249,12 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 2. [ ] VIEWER 无字段检查即可完成：`complete-document-with-token.ts:275`（fields 为空）
 3. [ ] 文档完成需要 VIEWER 为 SIGNED：`complete-document-with-token.ts:462-463`
 4. [ ] 完成页面根据角色显示不同标题：`complete.tsx:184-188`
+
+#### ✅ 验证签署顺序机制（修正）
+1. [ ] 检查 `add-signers.tsx:358-361`：前端拖拽后强制重新分配 `index + 1`
+2. [ ] 检查 `send-document.ts:102-106`：顺序签署只通知 `slice(0, 1)` 第一个收件人
+3. [ ] 检查 `complete-document-with-token.ts:395`：取 `pendingRecipients[0]` 作为下一个
+4. [ ] 结论：不存在"同号并行"，实际是严格的"逐人放行"
 
 #### ✅ 验证流程推进逻辑
 1. [ ] 并行签署：所有非 CC 同时收到通知：`send-document.ts:100-111`
@@ -1097,14 +1304,15 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 | 邮件通知 | `send-signing-email.handler.ts:98` | VIEWER 接收 VIEW_REQUEST 邮件 |
 | 完成页面 | `complete.tsx:186` | VIEWER 完成页面显示 "Document Viewed" |
 
-### 12.3 三角色核心差异总览
+### 12.3 三角色核心差异总览（修正版）
 
 | 维度 | SIGNER (签署人) | APPROVER (审批人) | VIEWER (见证人) |
 |-----|----------------|------------------|----------------|
 | **核心职责** | 签署文档，承担法律责任 | 审批通过，确认内容合规 | 见证签署过程，确认属实 |
-| **核心动作** | 签名 + 填写字段 | 点击批准 | 点击确认查看 |
-| **签名字段** | ✅ 必须有 | ❌ 不需要 | ❌ 不需要 |
-| **字段分配** | 所有类型 | 除签名外 | ❌ 不可分配 |
+| **核心动作** | 签名 + 填写字段 | 点击批准（可填字段） | 点击确认查看 |
+| **签名字段** | ✅ **必须有** | ✅ **可分配（非必须）** | ❌ **不可分配** |
+| **字段分配** | 所有类型 | 所有类型 | ❌ 不可分配 |
+| **服务端校验** | 验证必须有签名字段 | 无强制校验 | 无强制校验 |
 | **前端表单** | 姓名 + 签名 | 姓名（通常无字段） | ❌ 无表单 |
 | **完成条件** | 所有必填字段已插入 + SIGNED | 所有必填字段已插入 + SIGNED | 只需 SIGNED |
 | **邮件类型** | SIGNING_REQUEST | APPROVE_REQUEST | VIEW_REQUEST |
@@ -1113,15 +1321,31 @@ CC角色在很多逻辑中被显式排除（`role: { not: RecipientRole.CC }`）
 | **阻塞流程** | ✅ 是 | ✅ 是 | ✅ 是 |
 | **审计追踪** | 记录 signingStatus + signedAt | 记录 signingStatus + signedAt | 记录 signingStatus + signedAt |
 
-### 12.4 关键设计洞察
+**修正说明**：
+- ❌ APPROVER 不是"不需要签名字段"，而是"可以有但不强制"
+- ✅ APPROVER 在前端UI中可以分配所有类型字段（包括签名字段）
+- ✅ 只有 SIGNER 在服务端被强制要求必须有签名字段
+
+### 12.4 关键设计洞察（修正版）
 
 1. **状态机复用**：所有参与流程的角色（SIGNER/APPROVER/VIEWER/ASSISTANT）都使用相同的 `SigningStatus` 状态机（NOT_SIGNED → SIGNED），大大简化了逻辑判断。
 
 2. **角色分流点**：代码中主要通过三处实现角色分流：
-   - **字段分配**：`recipient-selector.tsx` 过滤 VIEWER/CC/ASSISTANT
+   - **字段分配**：`recipient-selector.tsx` 过滤 VIEWER/CC/ASSISTANT，保留 SIGNER/APPROVER
    - **邮件类型**：`RECIPIENT_ROLE_TO_EMAIL_TYPE` 映射决定邮件内容
    - **前端展示**：`envelope-signer-form.tsx` 和 `complete.tsx` 根据角色显示不同UI
 
 3. **见证人设计**：VIEWER 作为见证人的设计非常巧妙——不需要签名字段，但必须主动点击完成，确保"见证"是一个主动确认行为，而不是被动接收。
 
 4. **CC 的"隐形"特性**：CC 角色在所有关键逻辑点（`role !== RecipientRole.CC`）被显式排除，形成了"参与但不影响流程"的独特定位。
+
+5. **签署顺序的"逐人放行"机制**：
+   - 前端拖拽排序会强制重新分配唯一的 signingOrder（`add-signers.tsx:358-361`）
+   - 发送时顺序签署只通知第一个 NOT_SIGNED 且非 CC 的收件人（`send-document.ts:102-106`）
+   - 完成后取 `pendingRecipients[0]` 作为下一个收件人（`complete-document-with-token.ts:395`）
+   - **不存在"同号并行"特性**，实际是严格的逐人放行
+
+6. **APPROVER 与 SIGNER 的核心差异**：
+   - SIGNER：服务端强制要求必须有签名字段
+   - APPROVER：前端可以分配签名字段，但服务端不强制要求
+   - 这种设计允许 APPROVER 在需要时也可以签名，但不强制要求
